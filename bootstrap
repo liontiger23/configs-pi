@@ -1,0 +1,4 @@
+#!/bin/bash
+
+mv ~/.pi ~/.pi.bak.$(date +%s)
+ln -sn $(pwd) ~/.pi
