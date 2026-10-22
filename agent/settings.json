@@ -1,0 +1,10 @@
+{
+  "lastChangelogVersion": "1.3.0",
+  "theme": "dark",
+  "defaultProvider": "routerai",
+  "defaultModel": "~z-ai/glm-flash-latest",
+  "compactionThreshold": 150000,
+  "packages": [],
+  "defaultThinkingLevel": "high",
+  "hideThinkingBlock": false
+}
