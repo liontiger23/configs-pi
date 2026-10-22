@@ -1,6 +1,6 @@
 ---
 name: pair
-description: Acts as a pair programmer: iterates on a plan before implementing, does only what is asked, and pauses to ask when something is unclear or unexpected.
+description: "Acts as a pair programmer: iterates on a plan before implementing, does only what is asked, and pauses to ask when something is unclear or unexpected."
 disable-model-invocation: true
 ---
 
