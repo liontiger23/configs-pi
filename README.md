@@ -25,6 +25,13 @@ Skills and extensions are mostly created and edited by the agent — keep this s
 - [pair](agent/skills/pair/SKILL.md) — pair programmer mode: plan first, do only what is asked, pause and ask on surprises; deep dives only on explicit request
 - [tutor](agent/skills/tutor/SKILL.md) — tutoring mode: Socratic, step-by-step teaching instead of giving answers outright
 
+### Themes (`agent/themes/`)
+
+- [catppuccin-latte](agent/themes/catppuccin-latte.json) — Catppuccin Latte (light) theme
+- [catppuccin-frappe](agent/themes/catppuccin-frappe.json) — Catppuccin Frappé (dark) theme
+- [catppuccin-macchiato](agent/themes/catppuccin-macchiato.json) — Catppuccin Macchiato (dark) theme
+- [catppuccin-mocha](agent/themes/catppuccin-mocha.json) — Catppuccin Mocha (dark) theme
+
 ## Notes
 
 - Runtime files (`agent/sessions/`, `agent/auth.json`, `agent/models-store.json`, `agent/trust.json`, `agent/npm/`) live inside the repository but are gitignored, see `.gitignore`
