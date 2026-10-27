@@ -3,4 +3,5 @@ agent/sessions/
 agent/auth.json
 agent/models-store.json
 agent/trust.json
+agent/routerai-endpoints.json
 *~

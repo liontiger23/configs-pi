@@ -7,11 +7,43 @@
  * Prices are fetched live from the RouterAI models endpoint and kept
  * up to date via a dynamic provider catalog (`fetchModels`):
  *   - On startup the last persisted catalog is restored (no network needed).
- *   - On `session_start` a networked refresh pulls fresh prices.
+ *   - Pricing is refreshed LAZILY, per model: `/endpoints` is fetched for the
+ *     current model only, at natural boundaries (session start, model select,
+ *     turn end, picker open) and only when its cached data is older than
+ *     `routerai.priceRefreshMinutes` (settings.json, default 5, 0 = manual
+ *     only; /routerai-refresh always bypasses the TTL). Each refresh is a
+ *     single request — no idle timers, no bulk sweeps of all 578 models.
+ *   - `/routerai-refresh` re-fetches the catalog list + the current model's
+ *     endpoint pricing (force), and re-applies the current model.
  *   - `/routerai-models` opens a searchable price picker (like /model)
- *     with capability filters, pin-for-comparison (ctrl+space) and a
- *     cost sort toggle (ctrl+s).
+ *     with capability filters, pin-for-comparison (ctrl+space), a cost
+ *     sort toggle (ctrl+s) and a deep refresh of visible+pinned models
+ *     (ctrl+r). Opening it TTL-debounces a cheap catalog-list refresh.
  *   - The footer shows per-million-token rates for the current model.
+ *
+ * Price accounting — the routing pitfall and how this extension fixes it:
+ *   The /api/v1/models list returns ONE `pricing` per model — the cheapest
+ *   provider's (e.g. Relace for glm-5.3-flash: 3.97/9.74/3.45 ₽/Mtok) — but
+ *   RouterAI routes requests to its "Приоритетный" provider (BytePlus:
+ *   17.27/57.55/3.45 ₽/Mtok) and bills at THAT provider's rates. In a 2026-10-27
+ *   session pi showed ~117 ₽ while the actual bill was ~673 ₽ (~5.7× low).
+ *
+ *   Fix — three layers, no provider pinning:
+ *   1. Per-provider pricing table: `fetchModels` also pulls
+ *      `GET /api/v1/models/{id}/endpoints` (public) for every model, building
+ *      model → provider → pricing. Cached in ~/.pi/agent/routerai-endpoints.json
+ *      so it works offline/at startup.
+ *   2. Routed-provider detection: RouterAI reports the actual upstream
+ *      provider on every stream chunk ("provider":"BytePlus"). The
+ *      `provider_stream_event` hook records it per model.
+ *   3. Cost correction: on `message_end` the recorded usage cost is recomputed
+ *      with the routed provider's real pricing and the message is replaced.
+ *      Before the first chunk of a request arrives (and for nested calls like
+ *      compaction that bypass `message_end`), estimates use the PRIORITY
+ *      provider's pricing — the first endpoint in the /endpoints list, which
+ *      matches RouterAI's stated default routing ("priority provider first,
+ *      on failure the cheapest of the rest") and the label observed on the
+ *      model pages. No hardcoded overrides.
  *
  * Context clamping for auto-compaction:
  *   The reported `contextWindow` of every RouterAI model is clamped to
@@ -61,6 +93,21 @@ import {
 	fuzzyFilter,
 } from "@earendil-works/pi-tui";
 
+interface RouterAIPricing {
+	prompt: number;
+	completion: number;
+	input_cache_read?: number;
+	input_cache_write?: number;
+}
+
+interface RouterAIEndpoint {
+	name: string;
+	provider_name: string;
+	tag: string;
+	pricing: RouterAIPricing;
+	quantization?: string | null;
+}
+
 interface RouterAIModel {
 	id: string;
 	name: string;
@@ -72,12 +119,7 @@ interface RouterAIModel {
 		input_modalities: string[];
 		output_modalities: string[];
 	};
-	pricing: {
-		prompt: number;
-		completion: number;
-		input_cache_read?: number;
-		input_cache_write?: number;
-	};
+	pricing: RouterAIPricing;
 	supported_parameters: string[] | null;
 	default_parameters: Record<string, unknown> | null;
 }
@@ -127,6 +169,109 @@ function getReserveTokens(): number {
 		// fall through to default
 	}
 	return 16_384;
+}
+
+// ── Per-provider endpoint pricing (lazy, per model) ──
+// model id → { checkedAt, priority, providers: key → pricing }.
+// Provider keys are the endpoint `tag` and `provider_name`, lowercased —
+// stream chunks report the display name ("BytePlus"), tags are "byteplus";
+// both map to the same pricing. `priority` is endpoints[0] — RouterAI's
+// priority provider, the one default routing bills at.
+const ENDPOINTS_CACHE_PATH = join(homedir(), ".pi", "agent", "routerai-endpoints.json");
+
+interface ModelEndpointPricing {
+	checkedAt: number;
+	priority?: { provider?: string; pricing: RouterAIPricing };
+	providers: Record<string, RouterAIPricing>;
+}
+
+const endpointPricing = new Map<string, ModelEndpointPricing>();
+
+function loadEndpointPricingCache(): void {
+	try {
+		if (!existsSync(ENDPOINTS_CACHE_PATH)) return;
+		const parsed = JSON.parse(readFileSync(ENDPOINTS_CACHE_PATH, "utf-8")) as {
+			models?: Record<string, ModelEndpointPricing>;
+		};
+		for (const [id, entry] of Object.entries(parsed.models ?? {})) {
+			// Note: entries from the older flat format ({id: {key: pricing}}) lack
+			// `providers` and are ignored — they'll be re-fetched lazily.
+			if (entry && typeof entry === "object" && entry.providers && typeof entry.providers === "object") {
+				endpointPricing.set(id, {
+					checkedAt: typeof entry.checkedAt === "number" ? entry.checkedAt : 0,
+					priority: entry.priority,
+					providers: entry.providers,
+				});
+			}
+		}
+	} catch {
+		// corrupt cache: ignore, will be rebuilt lazily
+	}
+}
+
+function saveEndpointPricingCache(): void {
+	try {
+		const models: Record<string, ModelEndpointPricing> = {};
+		for (const [id, entry] of endpointPricing) {
+			models[id] = entry;
+		}
+		writeFileSync(
+			ENDPOINTS_CACHE_PATH,
+			JSON.stringify({ checkedAt: Date.now(), models }, null, 2) + "\n",
+			"utf-8",
+		);
+	} catch {
+		// best effort
+	}
+}
+
+loadEndpointPricingCache();
+
+function recordEndpointPricing(id: string, endpoints: RouterAIEndpoint[]): void {
+	const providers: Record<string, RouterAIPricing> = {};
+	for (const e of endpoints) {
+		if (!e.pricing) continue;
+		if (e.tag) providers[e.tag.toLowerCase()] = e.pricing;
+		if (e.provider_name) providers[e.provider_name.toLowerCase()] = e.pricing;
+	}
+	if (Object.keys(providers).length === 0) return;
+	const first = endpoints[0];
+	endpointPricing.set(id, {
+		checkedAt: Date.now(),
+		priority: first?.pricing
+			? { provider: first.tag ?? first.provider_name, pricing: first.pricing }
+			: undefined,
+		providers,
+	});
+}
+
+/** Pricing for a routed provider (chunk `provider` value or endpoint tag). */
+function lookupEndpointPricing(modelId: string, provider: string): RouterAIPricing | undefined {
+	return endpointPricing.get(modelId)?.providers[provider.toLowerCase()];
+}
+
+// Routed provider as reported on stream chunks, per model id. The agent loop
+// is sequential, so the latest value per model is the one to bill with.
+const routedProvider = new Map<string, string>();
+
+/**
+ * TTL for cached per-model pricing and the catalog list, in minutes (settings
+ * `routerai.priceRefreshMinutes`; 0 = refresh only via /routerai-refresh and
+ * picker ctrl+r). Each lazy refresh is a single request, so the default is
+ * small. Applies at natural boundaries only — session start, model select,
+ * turn end, picker open — never on an idle timer.
+ */
+function getPriceRefreshMinutes(): number {
+	try {
+		if (existsSync(SETTINGS_PATH)) {
+			const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+			const value = parsed["routerai"]?.["priceRefreshMinutes"];
+			if (typeof value === "number" && value >= 0) return value;
+		}
+	} catch {
+		// fall through to default
+	}
+	return 5;
 }
 
 // ── GLM reasoning replay normalization ──
@@ -242,7 +387,7 @@ function supportsImages(inputModalities: string[]): boolean {
 	return inputModalities.includes("image");
 }
 
-function toModelDef(m: RouterAIModel): Model<"openai-completions"> {
+function toModelDef(m: RouterAIModel, basePricing?: RouterAIPricing): Model<"openai-completions"> {
 	const inputModalities: ("text" | "image")[] = ["text"];
 	if (supportsImages(m.architecture.input_modalities ?? [])) {
 		inputModalities.push("image");
@@ -255,11 +400,17 @@ function toModelDef(m: RouterAIModel): Model<"openai-completions"> {
 	const contextWindow = clampContextWindow(realContextWindow);
 
 	// RouterAI returns prices in RUB/token. Keep as RUB per million tokens.
+	// Base estimate = the PRIORITY provider's pricing (first endpoint in the
+	// /endpoints list — matches RouterAI's default routing and the site's
+	// «Приоритетный» label), falling back to the list price (cheapest
+	// provider). Once a request's routed provider is known, `message_end`
+	// recomputes cost from that provider's exact endpoint pricing.
+	const p = basePricing ?? m.pricing;
 	const cost = {
-		input: m.pricing.prompt * 1_000_000,
-		output: m.pricing.completion * 1_000_000,
-		cacheRead: (m.pricing.input_cache_read ?? 0) * 1_000_000,
-		cacheWrite: (m.pricing.input_cache_write ?? 0) * 1_000_000,
+		input: p.prompt * 1_000_000,
+		output: p.completion * 1_000_000,
+		cacheRead: (p.input_cache_read ?? 0) * 1_000_000,
+		cacheWrite: (p.input_cache_write ?? 0) * 1_000_000,
 	};
 
 	const reasoning = supportsReasoning(m);
@@ -298,6 +449,41 @@ function toModelDef(m: RouterAIModel): Model<"openai-completions"> {
 	return model;
 }
 
+async function fetchModelEndpoints(
+	id: string,
+	signal?: AbortSignal,
+): Promise<RouterAIEndpoint[] | undefined> {
+	try {
+		const response = await fetch(`${BASE_URL}/models/${id}/endpoints`, {
+			headers: { Accept: "application/json" },
+			...(signal ? { signal } : {}),
+		});
+		if (!response.ok) return undefined;
+		const payload = (await response.json()) as { data?: { endpoints?: RouterAIEndpoint[] } };
+		return payload.data?.endpoints;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Timestamp of the persisted catalog (models-store.json), so a catalog
+ * freshly restored at startup isn't immediately re-fetched by the picker. */
+function readModelsStoreCheckedAt(): number {
+	try {
+		const storePath = join(homedir(), ".pi", "agent", "models-store.json");
+		if (!existsSync(storePath)) return 0;
+		const parsed = JSON.parse(readFileSync(storePath, "utf-8")) as {
+			routerai?: { checkedAt?: number };
+		};
+		return typeof parsed.routerai?.checkedAt === "number" ? parsed.routerai.checkedAt : 0;
+	} catch {
+		return 0;
+	}
+}
+
+/** Last time the RouterAI model catalog was fetched from the network. */
+let lastCatalogFetchAt = readModelsStoreCheckedAt();
+
 async function fetchRouterAIModels(signal?: AbortSignal): Promise<Model<"openai-completions">[]> {
 	const response = await fetch(`${BASE_URL}/models`, {
 		headers: { Accept: "application/json" },
@@ -309,10 +495,18 @@ async function fetchRouterAIModels(signal?: AbortSignal): Promise<Model<"openai-
 	}
 
 	const payload = (await response.json()) as { data: RouterAIModel[] };
+	lastCatalogFetchAt = Date.now();
 
-	return payload.data
-		.filter((m) => isTextModel(m.architecture.modality))
-		.map(toModelDef);
+	const candidates = payload.data.filter((m) => isTextModel(m.architecture.modality));
+
+	// Per-provider pricing is fetched LAZILY, per model (see ensureFreshPricing):
+	// fetching /endpoints for all ~500 models here would mean one bulk sweep of
+	// 500 requests on every refresh. Base price comes from the cached priority
+	// provider when known; models never fetched yet fall back to the list price
+	// (cheapest provider) until they are used or inspected in the picker.
+	return candidates.map((m) =>
+		toModelDef(m, endpointPricing.get(m.id)?.priority?.pricing),
+	);
 }
 
 function fmtPrice(rubPerMtok: number): string {
@@ -360,6 +554,7 @@ interface SortOption {
 
 const PIN_KEY = "ctrl+space";
 const SORT_KEY = "ctrl+s";
+const REFRESH_KEY = "ctrl+r";
 const PIN_MARKER = "◆ ";
 
 // Aligned side-by-side comparison table for pinned models.
@@ -396,6 +591,12 @@ export default async function (pi: ExtensionAPI) {
 		}
 	});
 
+	// ── Provider pin + GLM reasoning replay ──
+	//
+	// 1. Pin the upstream provider (settings `routerai.provider`): inject
+	//    `provider.only` / `provider.order` into the request body (see
+	//    https://routerai.ru/docs/guides/overview/provider-selection). Not
+	//    injected if the payload already carries a `provider` object.
 	// ── GLM reasoning replay: reasoning → reasoning_content ──
 	// Keep RouterAI's OpenRouter-style request format (it works), but make
 	// the replayed reasoning trace visible to GLM chat templates. See header
@@ -403,6 +604,68 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_ID || !ctx.model.reasoning) return undefined;
 		return normalizeReasoningReplay(event.payload);
+	});
+
+	// ── Routed-provider tracking + cost correction ──
+	//
+	// RouterAI reports the actual upstream provider on every stream chunk
+	// ("provider":"BytePlus"). Record it per model, then on `message_end`
+	// recompute the recorded usage cost with THAT provider's endpoint pricing
+	// — the model's list price is the cheapest provider's, which can be ~6×
+	// lower than what routing actually bills.
+	pi.on("provider_stream_event", (event) => {
+		const chunk = event.data as { provider?: unknown } | null | undefined;
+		if (chunk && typeof chunk === "object" && typeof chunk.provider === "string" && chunk.provider) {
+			routedProvider.set(event.model, chunk.provider);
+		}
+	});
+
+	/**
+	 * Recompute a usage record's cost with the routed provider's per-token
+	 * rates (mirrors pi-ai's calculateCost). Returns true when applied.
+	 */
+	function applyEndpointPricing(
+		modelId: string,
+		usage: {
+			input: number; output: number; cacheRead: number; cacheWrite: number;
+			cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+		},
+	): boolean {
+		const provider = routedProvider.get(modelId);
+		if (!provider) return false;
+		const pricing = lookupEndpointPricing(modelId, provider);
+		if (!pricing) return false;
+		usage.cost.input = usage.input * pricing.prompt;
+		usage.cost.output = usage.output * pricing.completion;
+		usage.cost.cacheRead = usage.cacheRead * (pricing.input_cache_read ?? 0);
+		usage.cost.cacheWrite = usage.cacheWrite * (pricing.input_cache_write ?? 0);
+		usage.cost.total =
+			usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+		return true;
+	}
+
+	pi.on("message_end", (event) => {
+		const msg = event.message as {
+			role?: string;
+			provider?: string;
+			model?: string;
+			usage?: {
+				input: number; output: number; cacheRead: number; cacheWrite: number;
+				cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+			};
+		};
+		if (
+			msg?.role !== "assistant" ||
+			msg.provider !== PROVIDER_ID ||
+			!msg.model ||
+			!msg.usage?.cost
+		) {
+			return undefined;
+		}
+		if (applyEndpointPricing(msg.model, msg.usage)) {
+			return { message: event.message };
+		}
+		return undefined;
 	});
 
 	// ── Dynamic provider: catalog (and prices) refresh via fetchModels ──
@@ -439,6 +702,94 @@ export default async function (pi: ExtensionAPI) {
 		api: openAICompletionsApi(),
 	}));
 
+	// ── Lazy per-model pricing refresh ──
+	// One /endpoints request per model, fetched only when that model's cached
+	// data is older than the TTL, and only at natural boundaries (session
+	// start, model select, turn end, picker open). Fire-and-forget — never
+	// delays a turn; network failures leave the previous data in place.
+
+	let refreshInFlight = false;
+
+	/**
+	 * Fetch /endpoints for one model if its cached pricing is stale (or always
+	 * with `force`), update the cache and the model def. Single-flight.
+	 */
+	async function ensureFreshPricing(ctx: ExtensionContext, modelId: string, force: boolean): Promise<void> {
+		if (refreshInFlight) return;
+		if (!force) {
+			const ttl = getPriceRefreshMinutes() * 60_000;
+			if (ttl === 0) return;
+			const cached = endpointPricing.get(modelId);
+			if (cached && Date.now() - cached.checkedAt < ttl) return;
+		}
+		refreshInFlight = true;
+		try {
+			const endpoints = await fetchModelEndpoints(modelId);
+			if (endpoints?.length) {
+				recordEndpointPricing(modelId, endpoints);
+				saveEndpointPricingCache();
+				await applyPricing(ctx, modelId);
+			}
+		} catch {
+			// non-fatal: stale pricing stays in use
+		} finally {
+			refreshInFlight = false;
+		}
+	}
+
+	/**
+	 * Patch the model def for `modelId` in place with its cached priority
+	 * pricing, and re-apply it as the current model so future estimates use
+	 * fresh prices. No-op when nothing is cached.
+	 */
+	async function applyPricing(ctx: ExtensionContext, modelId: string): Promise<void> {
+		const priority = endpointPricing.get(modelId)?.priority?.pricing;
+		if (!priority) return;
+		const fresh = ctx.modelRegistry
+			.getAll()
+			.find((m) => m.provider === PROVIDER_ID && m.id === modelId);
+		if (!fresh) return;
+		fresh.cost = {
+			input: priority.prompt * 1_000_000,
+			output: priority.completion * 1_000_000,
+			cacheRead: (priority.input_cache_read ?? 0) * 1_000_000,
+			cacheWrite: (priority.input_cache_write ?? 0) * 1_000_000,
+		};
+		const model = ctx.model;
+		if (model?.provider === PROVIDER_ID && model.id === modelId) {
+			await pi.setModel(fresh);
+		}
+	}
+
+	/**
+	 * Refresh the catalog list (1 request) and force-refresh the current
+	 * model's endpoint pricing (1 request); re-applies the current model and
+	 * updates the footer. `notify` controls user-facing messages (silent for
+	 * background refreshes).
+	 */
+	async function refreshPrices(ctx: ExtensionContext, notify: boolean): Promise<boolean> {
+		try {
+			const result = await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true });
+			const error = result.errors.get(PROVIDER_ID);
+			if (error) {
+				if (notify) ctx.ui.notify(`RouterAI price refresh failed, showing cached prices (${error.message})`, "warning");
+				return false;
+			}
+			const model = ctx.model;
+			if (model?.provider === PROVIDER_ID) {
+				await ensureFreshPricing(ctx, model.id, true);
+			}
+			updateFooter(ctx);
+			if (notify) ctx.ui.notify("RouterAI prices refreshed", "info");
+			return true;
+		} catch (error) {
+			if (notify) {
+				ctx.ui.notify(`RouterAI price refresh failed (${error instanceof Error ? error.message : String(error)})`, "warning");
+			}
+			return false;
+		}
+	}
+
 	// ── Footer status: rates for the current model + session spend ──
 
 	function routeraiModels(ctx: ExtensionContext): RouterAIModelType[] {
@@ -450,8 +801,16 @@ export default async function (pi: ExtensionAPI) {
 	function sessionCost(ctx: ExtensionContext): number {
 		let cost = 0;
 		for (const entry of ctx.sessionManager.getBranch()) {
+			// Assistant messages…
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				cost += (entry.message as { usage?: { cost?: { total?: number } } }).usage?.cost?.total ?? 0;
+			}
+			// …and compactions: each compaction runs an LLM call (full uncached
+			// context + summary output) whose usage/cost pi records on the
+			// compaction entry itself. Skipping it made the footer drift below
+			// pi's own total after every compaction.
+			if (entry.type === "compaction") {
+				cost += (entry as { usage?: { cost?: { total?: number } } }).usage?.cost?.total ?? 0;
 			}
 		}
 		return cost;
@@ -463,9 +822,20 @@ export default async function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("routerai", undefined);
 			return;
 		}
-		const rates = `${fmtPrice(model.cost.input)}/${fmtPrice(model.cost.output)} ₽/Mtok`;
+		// Show the routed provider's real rates once known — they're what
+		// requests are actually billed at; before the first response the
+		// catalog's priority-provider estimate is shown.
+		const via = routedProvider.get(model.id);
+		const routed = via ? lookupEndpointPricing(model.id, via) : undefined;
+		const inR = (routed?.prompt ?? model.cost.input / 1_000_000) * 1_000_000;
+		const outR = (routed?.completion ?? model.cost.output / 1_000_000) * 1_000_000;
+		const cacheR = (routed?.input_cache_read ?? model.cost.cacheRead / 1_000_000) * 1_000_000;
+		const rates = `${fmtPrice(inR)}/${fmtPrice(outR)}/${fmtPrice(cacheR)} ₽/Mtok`;
 		const spent = `₽${sessionCost(ctx).toFixed(3)}`;
-		ctx.ui.setStatus("routerai", ctx.ui.theme.fg("dim", `₽ ${rates} · ${spent}`));
+		ctx.ui.setStatus(
+			"routerai",
+			ctx.ui.theme.fg("dim", `₽ ${rates} · ${spent}${via ? ` · via ${via}` : ""}`),
+		);
 	}
 
 	// ── /routerai-models: searchable, filterable price picker ──
@@ -488,6 +858,17 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("routerai-models", {
 		description: "Searchable RouterAI model picker with prices and capability filters",
 		handler: async (_args, ctx) => {
+			// TTL-debounced catalog refresh on open: at most one list request
+			// when the snapshot is older than the TTL, so the picker shows
+			// current models/prices. Falls back to cached models when offline.
+			const ttlMinutes = getPriceRefreshMinutes();
+			if (ttlMinutes > 0 && Date.now() - lastCatalogFetchAt > ttlMinutes * 60_000) {
+				try {
+					await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true });
+				} catch {
+					// fall back to cached models
+				}
+			}
 			const models = routeraiModels(ctx);
 			if (models.length === 0) {
 				ctx.ui.notify("No RouterAI models loaded yet — try again after the catalog refresh completes", "warning");
@@ -552,6 +933,7 @@ export default async function (pi: ExtensionAPI) {
 					const listContainer = new Container();
 					const countLine = new Text("", 0, 0);
 					const pinTable = new Text("", 0, 0);
+					const statusLine = new Text("", 0, 0);
 					const sortStatus = new Text("", 0, 0);
 
 					let selectList = new SelectList([], 10, selectTheme, listLayout);
@@ -658,11 +1040,50 @@ export default async function (pi: ExtensionAPI) {
 						refresh(true);
 					}
 
+					// ctrl+r: deep-refresh the visible page + pinned models — fetch
+					// each one's /endpoints (a handful of requests, not a bulk sweep),
+					// update the cache and patch this picker's model objects in place.
+					let deepRefreshing = false;
+					async function deepRefresh() {
+						if (deepRefreshing) return;
+						const visible = computeFiltered().slice(0, 10).map((item) => item.model);
+						const pins = [...pinnedIds]
+							.map((id) => byId.get(id)?.model)
+							.filter((m): m is RouterAIModelType => m !== undefined);
+						const ids = [...new Set([...pins, ...visible].map((m) => m.id))];
+						if (ids.length === 0) return;
+						deepRefreshing = true;
+						statusLine.setText(theme.fg("warning", "  ⟳ refreshing prices…"));
+						tui.requestRender();
+						try {
+							let updated = 0;
+							for (const id of ids) {
+								try {
+									const endpoints = await fetchModelEndpoints(id);
+									if (endpoints?.length) {
+										recordEndpointPricing(id, endpoints);
+										updated++;
+									}
+								} catch {
+									// skip failed model
+								}
+							}
+							if (updated > 0) saveEndpointPricingCache();
+							for (const id of ids) await applyPricing(ctx, id);
+							statusLine.setText(theme.fg("dim", `  ⟳ refreshed ${updated}/${ids.length} models`));
+						} finally {
+							deepRefreshing = false;
+						}
+						refresh(true);
+						tui.requestRender();
+					}
+
 					container.addChild(countLine);
 					container.addChild(pinTable);
 					container.addChild(listContainer);
+					container.addChild(statusLine);
 					container.addChild(sortStatus);
-					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${PIN_KEY} pin/unpin · filters: ${filtersHint}`)));
+					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${PIN_KEY} pin/unpin · ${SORT_KEY} sort · ${REFRESH_KEY} refresh prices · filters: ${filtersHint}`)));
 
 					refresh(false);
 
@@ -684,6 +1105,8 @@ export default async function (pi: ExtensionAPI) {
 								kb.matches(data, "tui.select.cancel")
 							) {
 								selectList.handleInput(data);
+							} else if (matchesKey(data, REFRESH_KEY)) {
+								void deepRefresh();
 							} else if (matchesKey(data, PIN_KEY)) {
 								pinHighlighted();
 							} else if (matchesKey(data, SORT_KEY)) {
@@ -704,6 +1127,15 @@ export default async function (pi: ExtensionAPI) {
 			if (!success) {
 				ctx.ui.notify(`Could not switch to ${result.provider}/${result.id} — no API key configured`, "warning");
 			}
+		},
+	});
+
+	// ── /routerai-refresh: force a price refresh now ──
+
+	pi.registerCommand("routerai-refresh", {
+		description: "Force-refresh RouterAI model catalog and prices",
+		handler: async (_args, ctx) => {
+			await refreshPrices(ctx, true);
 		},
 	});
 
@@ -816,28 +1248,22 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		// The persisted catalog is already restored at this point (offline phase).
-		// Kick off a networked refresh for up-to-date prices; failures are
-		// non-fatal — the restored catalog stays usable.
-		ctx.modelRegistry
-			.refresh({ providers: [PROVIDER_ID], force: true })
-			.then((result) => {
-				const error = result.errors.get(PROVIDER_ID);
-				if (error) {
-					ctx.ui.notify(`RouterAI price refresh failed, showing cached prices (${error.message})`, "warning");
-				}
-			})
-			.catch((error: unknown) => {
-				ctx.ui.notify(`RouterAI price refresh failed (${error instanceof Error ? error.message : String(error)})`, "warning");
-			});
-
+		// Kick off a lazy refresh: catalog list (1 request) + the current model's
+		// endpoint pricing (1 request). Failures are non-fatal — cached data
+		// stays usable.
+		void refreshPrices(ctx, false);
 		updateFooter(ctx);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		updateFooter(ctx);
+		const model = ctx.model;
+		if (model?.provider === PROVIDER_ID) void ensureFreshPricing(ctx, model.id, false);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		updateFooter(ctx);
+		const model = ctx.model;
+		if (model?.provider === PROVIDER_ID) void ensureFreshPricing(ctx, model.id, false);
 	});
 }
