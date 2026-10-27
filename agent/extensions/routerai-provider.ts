@@ -26,6 +26,7 @@
  *     mode (ctrl+o: ↑↓ choose, ←→ move, ctrl+space remove); the ordered
  *     list is sent as `provider.order` (fallbacks allowed — preference,
  *     not a hard pin), "Auto" restores RouterAI's default routing.
+ *     Choices persist in settings.json (`routerai.providerPrefs`).
  *   - The footer shows per-million-token rates for the current model.
  *
  * Price accounting — the routing pitfall and how this extension fixes it:
@@ -274,12 +275,51 @@ function lookupEndpointPricing(modelId: string, provider: string): RouterAIPrici
 const routedProvider = new Map<string, string>();
 
 // Preferred upstream providers per model id (lowercase tags, e.g. "relace"),
-// session-scoped, ORDERED — injected into request bodies as `provider.order`
-// with fallbacks allowed: RouterAI serves the request from the first healthy
-// provider in the list, falling back to its own routing otherwise. Chosen via
+// ORDERED — injected into request bodies as `provider.order` with fallbacks
+// allowed: RouterAI serves the request from the first healthy provider in
+// the list, falling back to its own routing otherwise. Chosen via
 // /routerai-providers or ctrl+p in the model picker (ctrl+space toggles,
-// ctrl+o reorder mode (↑↓ pick, ←→ move), enter applies).
+// ctrl+o reorder mode (↑↓ pick, ←→ move), enter applies). PERSISTED in
+// settings.json as `routerai.providerPrefs` ({ modelId: [tags…] }) and
+// reloaded on every start; note settings.json is live config — the file
+// changes when a preference is picked, and committing it needs approval
+// (see ~/.pi/AGENTS.md).
 const providerPrefs = new Map<string, string[]>();
+
+/** Load `routerai.providerPrefs` from settings.json ({ modelId: [tags…] }). */
+function loadProviderPrefsFromSettings(): void {
+	try {
+		if (!existsSync(SETTINGS_PATH)) return;
+		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+		const stored = parsed["routerai"]?.["providerPrefs"];
+		if (!stored || typeof stored !== "object") return;
+		for (const [id, tags] of Object.entries(stored)) {
+			if (!Array.isArray(tags)) continue;
+			const clean = tags.filter((t): t is string => typeof t === "string" && t.length > 0);
+			if (clean.length > 0) providerPrefs.set(id, clean);
+		}
+	} catch {
+		// malformed settings: start empty
+	}
+}
+
+/** Write the current preferences back to settings.json (read-modify-write,
+ * preserving all other settings). Removes the key entirely when empty. */
+function saveProviderPrefsToSettings(): void {
+	try {
+		const settings = existsSync(SETTINGS_PATH)
+			? JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"))
+			: {};
+		const routerai = settings["routerai"] ??= {};
+		if (providerPrefs.size === 0) delete routerai["providerPrefs"];
+		else routerai["providerPrefs"] = Object.fromEntries(providerPrefs);
+		writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+	} catch {
+		// best effort: the preference stays active for this session
+	}
+}
+
+loadProviderPrefsFromSettings();
 
 /**
  * TTL for cached per-model pricing and the catalog list, in minutes (settings
@@ -1475,8 +1515,9 @@ export default async function (pi: ExtensionAPI) {
 			const names = result.tags
 				.map((t) => byValue.get(t)?.label.replace(PIN_MARKER, "") ?? t)
 				.join(" → ");
-			ctx.ui.notify(`${model.name}: provider preference ${names}`, "info");
+			ctx.ui.notify(`${model.name}: provider preference ${names} (saved to settings.json)`, "info");
 		}
+		saveProviderPrefsToSettings();
 		if (ctx.model?.provider === PROVIDER_ID && ctx.model?.id === model.id) {
 			updateFooter(ctx);
 		}

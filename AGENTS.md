@@ -23,3 +23,11 @@ settings, keybindings, instructions, and resources.
   section of `README.md` — keep the one-line descriptions accurate and the
   relative links working.
 - Commit changes to git. Ask before pushing.
+- `agent/settings.json` is live configuration, not code: extensions (e.g.
+  routerai-provider's provider preferences, compaction threshold) and pi
+  itself write to it at runtime. Changes to it must not be committed
+  without the user's explicit approval — when a commit would include
+  settings.json, call it out and ask first.
+- Runtime data rules above apply equally to other extension-written files
+  (e.g. `agent/routerai-endpoints.json`): keep them gitignored, never
+  commit them.
