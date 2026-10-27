@@ -23,9 +23,9 @@
  *     refresh.
  *   - `/routerai-providers` opens the same provider preference chooser
  *     for the current model: multi-select (ctrl+space) and reorder
- *     (ctrl+up/ctrl+down) upstream providers; the ordered list is sent
- *     as `provider.order` (fallbacks allowed — preference, not a hard
- *     pin), "Auto" restores RouterAI's default routing.
+ *     mode (ctrl+o: ↑↓ choose, ←→ move, ctrl+space remove); the ordered
+ *     list is sent as `provider.order` (fallbacks allowed — preference,
+ *     not a hard pin), "Auto" restores RouterAI's default routing.
  *   - The footer shows per-million-token rates for the current model.
  *
  * Price accounting — the routing pitfall and how this extension fixes it:
@@ -278,7 +278,7 @@ const routedProvider = new Map<string, string>();
 // with fallbacks allowed: RouterAI serves the request from the first healthy
 // provider in the list, falling back to its own routing otherwise. Chosen via
 // /routerai-providers or ctrl+p in the model picker (ctrl+space toggles,
-// ctrl+up/ctrl+down orders, enter applies).
+// ctrl+o reorder mode (↑↓ pick, ←→ move), enter applies).
 const providerPrefs = new Map<string, string[]>();
 
 /**
@@ -593,6 +593,7 @@ const PIN_KEY = "ctrl+space";
 const SORT_KEY = "ctrl+s";
 const REFRESH_KEY = "ctrl+r";
 const PROV_KEY = "ctrl+p";
+const ORDER_KEY = "ctrl+o";
 const PIN_MARKER = "◆ ";
 
 // Aligned side-by-side comparison table for pinned models.
@@ -1191,9 +1192,16 @@ export default async function (pi: ExtensionAPI) {
 	//
 	// Same UX as the model picker: search, sort cycling, filter tokens.
 	// Multi-select with explicit ordering, mirroring the pin-for-comparison
-	// UX: ctrl+space toggles providers into the preference list (◆ marker,
-	// numbered table like the pinned comparison), ctrl+up/ctrl+down moves the
-	// highlighted provider within the order. Enter applies:
+	// UX, in two modes (ctrl+arrows are taken by pi's transcript scrolling,
+	// so reordering gets its own mode):
+	//   select mode — navigate/search all providers, ctrl+space toggles them
+	//     into the preference list (◆ marker, numbered table like the pinned
+	//     comparison)
+	//   reorder mode (ctrl+o) — the list shows only the drafted providers:
+	//     ↑↓ pick one, ←→ move it within the order, ctrl+space removes it,
+	//     ctrl+o back to select mode (exits automatically when the draft
+	//     becomes empty)
+	// Enter applies:
 	//   - on "Auto" — clears the preference (RouterAI default routing)
 	//   - on a provider row — applies the draft order; with an empty draft it
 	//     is a shortcut for "prefer exactly this one"
@@ -1251,6 +1259,7 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		const draft = [...(providerPrefs.get(model.id) ?? [])].filter((t) => byValue.has(t));
+		let reorderMode = false;
 
 		const SORTS: { id: string; label: string; price?: (e: ProviderEndpoint) => number }[] = [
 			// RouterAI's reported endpoint order (priority provider first)
@@ -1305,7 +1314,7 @@ export default async function (pi: ExtensionAPI) {
 						prefTable.setText("");
 						return;
 					}
-					const lines = [theme.fg("accent", `⭑ Preference order — enter applies · ${PIN_KEY} unpin · ${"ctrl+up"}/${"ctrl+down"} reorder`)];
+					const lines = [theme.fg("accent", `⭑ Preference order (tried top to bottom) — enter applies · ${ORDER_KEY} reorder`)];
 					draft.forEach((tag, i) => {
 						const o = byValue.get(tag);
 						const e = o?.endpoint;
@@ -1348,7 +1357,9 @@ export default async function (pi: ExtensionAPI) {
 
 				function refresh(keepSelection: boolean) {
 					const previousId = keepSelection ? selectList.getSelectedItem()?.value : undefined;
-					const filtered = computeFiltered();
+					const filtered = reorderMode
+						? draft.map((tag) => byValue.get(tag)).filter((o): o is ProviderOption => o !== undefined)
+						: computeFiltered();
 					selectList = new SelectList(filtered, 12, selectTheme, listLayout);
 					selectList.onSelect = (item) => {
 						const option = item as ProviderOption;
@@ -1378,6 +1389,13 @@ export default async function (pi: ExtensionAPI) {
 					else draft.splice(idx, 1);
 					relabel();
 					setPrefTable();
+					// Removing the last entry in reorder mode: nothing left to order —
+					// exit first so the refresh shows the full list again.
+					if (reorderMode && draft.length === 0) {
+						reorderMode = false;
+					}
+					refresh(true);
+					setModeLine();
 				}
 
 				function moveHighlighted(delta: number) {
@@ -1390,25 +1408,40 @@ export default async function (pi: ExtensionAPI) {
 					draft.splice(idx, 1);
 					draft.splice(to, 0, item.value);
 					setPrefTable();
+					refresh(true);
 				}
 
+				function setModeLine() {
+					modeLine.setText(reorderMode
+						? theme.fg("warning", `  REORDER — ↑↓ choose · ←→ move · ${PIN_KEY} remove · ${ORDER_KEY} back`)
+						: theme.fg("dim", `  select — ${PIN_KEY} add/remove from preference · ${ORDER_KEY} reorder`));
+				}
+
+				const modeLine = new Text("", 0, 0);
 				container.addChild(countLine);
 				container.addChild(prefTable);
 				container.addChild(listContainer);
 				container.addChild(sortStatus);
-				container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter apply · esc cancel · ${PIN_KEY} toggle · ctrl+up/ctrl+down reorder · ${SORT_KEY} sort · filters: ${filtersHint}`)));
+				container.addChild(modeLine);
+				container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter apply · esc cancel · ${SORT_KEY} sort · filters: ${filtersHint}`)));
 
 				relabel();
 				refresh(false);
 				setPrefTable();
+				setModeLine();
 
 				return {
 					render: (width: number) => container.render(width),
 					invalidate: () => container.invalidate(),
 					handleInput(data: string) {
-						if (matchesKey(data, "ctrl+up")) {
+						if (matchesKey(data, ORDER_KEY)) {
+							// Toggle reorder mode; needs a non-empty draft.
+							reorderMode = !reorderMode && draft.length > 0;
+							refresh(true);
+							setModeLine();
+						} else if (reorderMode && matchesKey(data, "left")) {
 							moveHighlighted(-1);
-						} else if (matchesKey(data, "ctrl+down")) {
+						} else if (reorderMode && matchesKey(data, "right")) {
 							moveHighlighted(1);
 						} else if (
 							kb.matches(data, "tui.select.up") ||
@@ -1422,7 +1455,8 @@ export default async function (pi: ExtensionAPI) {
 						} else if (matchesKey(data, SORT_KEY)) {
 							sortIndex = (sortIndex + 1) % SORTS.length;
 							refresh(true);
-						} else {
+						} else if (!reorderMode) {
+							// Typing only makes sense in select mode.
 							searchInput.handleInput(data);
 							refresh(false);
 						}
