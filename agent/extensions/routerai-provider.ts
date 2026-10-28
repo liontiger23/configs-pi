@@ -889,22 +889,55 @@ export default async function (pi: ExtensionAPI) {
 		);
 	}
 
-	function sessionCost(ctx: ExtensionContext): number {
-		let cost = 0;
+	interface SessionCostBreakdown {
+		input: number;
+		output: number;
+		/** cacheRead + cacheWrite */
+		cache: number;
+		total: number;
+	}
+
+	function addUsageCost(
+		sum: SessionCostBreakdown,
+		cost: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } | undefined,
+	) {
+		if (!cost) return;
+		sum.input += cost.input ?? 0;
+		sum.output += cost.output ?? 0;
+		sum.cache += (cost.cacheRead ?? 0) + (cost.cacheWrite ?? 0);
+		sum.total += cost.total ?? 0;
+	}
+
+	function sessionCost(ctx: ExtensionContext): SessionCostBreakdown {
+		const sum: SessionCostBreakdown = { input: 0, output: 0, cache: 0, total: 0 };
 		for (const entry of ctx.sessionManager.getBranch()) {
 			// Assistant messages…
 			if (entry.type === "message" && entry.message.role === "assistant") {
-				cost += (entry.message as { usage?: { cost?: { total?: number } } }).usage?.cost?.total ?? 0;
+				addUsageCost(
+					sum,
+					(
+						entry.message as {
+							usage?: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } };
+						}
+					).usage?.cost,
+				);
 			}
 			// …and compactions: each compaction runs an LLM call (full uncached
 			// context + summary output) whose usage/cost pi records on the
 			// compaction entry itself. Skipping it made the footer drift below
 			// pi's own total after every compaction.
 			if (entry.type === "compaction") {
-				cost += (entry as { usage?: { cost?: { total?: number } } }).usage?.cost?.total ?? 0;
+				addUsageCost(
+					sum,
+					(
+						entry as {
+							usage?: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } };
+						}
+					).usage?.cost,
+				);
 			}
 		}
-		return cost;
+		return sum;
 	}
 
 	function updateFooter(ctx: ExtensionContext) {
@@ -922,7 +955,15 @@ export default async function (pi: ExtensionAPI) {
 		const outR = (routed?.completion ?? model.cost.output / 1_000_000) * 1_000_000;
 		const cacheR = (routed?.input_cache_read ?? model.cost.cacheRead / 1_000_000) * 1_000_000;
 		const rates = `${fmtPrice(inR)}/${fmtPrice(outR)}/${fmtPrice(cacheR)} ₽/Mtok`;
-		const spent = `₽${sessionCost(ctx).toFixed(3)}`;
+		const cost = sessionCost(ctx);
+		// Total spend, then the input/output/cache split in fixed positions
+		// (same format as turn-timer's summary). Currency symbol once, bare
+		// numbers inside; the split is omitted when it's all zeros.
+		const split =
+			cost.input > 0 || cost.output > 0 || cost.cache > 0
+				? ` (${cost.input.toFixed(3)}/${cost.output.toFixed(3)}/${cost.cache.toFixed(3)})`
+				: "";
+		const spent = `₽${cost.total.toFixed(3)}${split}`;
 		const pref = providerPrefs.get(model.id);
 		ctx.ui.setStatus(
 			"routerai",
