@@ -116,6 +116,8 @@ export default function (pi: ExtensionAPI) {
   let turns = 0;
   let baselineCost: CostBreakdown | undefined;
   let baselineCompactions = 0;
+  /** Session entries accessor for the active run, for footer cost updates. */
+  let runEntries: (() => readonly SessionEntry[]) | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let runUi: ExtensionUIContext | undefined;
   let runTheme: Theme | undefined;
@@ -141,7 +143,14 @@ export default function (pi: ExtensionAPI) {
 
   const renderFooter = () => {
     if (runStart === undefined || runTheme === undefined) return;
-    setFooter(runTheme.fg("dim", `⏱ ${format(runStart)}`));
+    let text = `⏱ ${format(runStart)}`;
+    if (runEntries && baselineCost) {
+      // Accrued cost for this turn cycle, same baseline-diff as the summary;
+      // recomputed per tick so compactions and usage entries are included.
+      const accrued = sessionCost(runEntries()).total - baselineCost.total;
+      if (accrued > 0) text += ` · ${formatCost(accrued)}`;
+    }
+    setFooter(runTheme.fg("dim", text));
   };
 
   pi.registerEntryRenderer<RunTimingData>(
@@ -187,6 +196,7 @@ export default function (pi: ExtensionAPI) {
     const baselineEntries = ctx.sessionManager.getEntries();
     baselineCost = sessionCost(baselineEntries);
     baselineCompactions = countCompactions(baselineEntries);
+    runEntries = () => ctx.sessionManager.getEntries();
     runUi = ctx.ui;
     runTheme = ctx.ui.theme;
     stopTicker();
@@ -230,6 +240,7 @@ export default function (pi: ExtensionAPI) {
     turns = 0;
     baselineCost = undefined;
     baselineCompactions = 0;
+    runEntries = undefined;
     runUi = undefined;
     runTheme = undefined;
   });
@@ -240,6 +251,7 @@ export default function (pi: ExtensionAPI) {
     turns = 0;
     baselineCost = undefined;
     baselineCompactions = 0;
+    runEntries = undefined;
     runUi = undefined;
     runTheme = undefined;
   });
