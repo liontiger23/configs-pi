@@ -7,12 +7,5 @@
   "packages": [],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": false,
-  "routerai": {
-    "providerPrefs": {
-      "~z-ai/glm-flash-latest": [
-        "relace",
-        "byteplus"
-      ]
-    }
-  }
+  "routerai": {}
 }
