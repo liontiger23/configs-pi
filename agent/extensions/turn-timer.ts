@@ -1,6 +1,7 @@
 import type {
   ExtensionAPI,
   ExtensionUIContext,
+  SessionEntry,
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -14,9 +15,11 @@ import { Text } from "@earendil-works/pi-tui";
  *
  * - Live elapsed time is shown in the footer while the run is active.
  * - When the run settles, the total is written inline in the transcript as a
- *   durable custom entry, together with the computed cost of all model turns
- *   and any compactions that ran during the cycle. If the run was
- *   interrupted, the entry says so.
+ *   durable custom entry, together with the computed cost of the run (model
+ *   turns, compactions, and any other session-attributed usage that accrued
+ *   during the cycle) and the number of compactions, both derived by diffing
+ *   session-entry totals against a baseline taken at run start. If the run
+ *   was interrupted, the entry says so.
  *
  * Lifecycle reference: `before_agent_start` opens the run window,
  * `agent_settled` closes it. See docs/extensions.md and docs/json.md.
@@ -46,11 +49,34 @@ function formatCost(usd: number): string {
   return `$${usd.toFixed(4)}`;
 }
 
+/** Session-attributed cost of a single entry, matching pi's own totals. */
+function entryCostUsd(entry: SessionEntry): number {
+  switch (entry.type) {
+    case "message":
+      return entry.message.role === "assistant"
+        ? (entry.message.usage?.cost?.total ?? 0)
+        : 0;
+    case "compaction":
+    case "usage":
+      return entry.usage?.cost?.total ?? 0;
+    default:
+      return 0;
+  }
+}
+
+function sessionCostUsd(entries: readonly SessionEntry[]): number {
+  return entries.reduce((sum, entry) => sum + entryCostUsd(entry), 0);
+}
+
+function countCompactions(entries: readonly SessionEntry[]): number {
+  return entries.filter((entry) => entry.type === "compaction").length;
+}
+
 export default function (pi: ExtensionAPI) {
   let runStart: number | undefined;
   let turns = 0;
-  let runCostUsd = 0;
-  let compactions = 0;
+  let baselineCostUsd = 0;
+  let baselineCompactions = 0;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let runUi: ExtensionUIContext | undefined;
   let runTheme: Theme | undefined;
@@ -108,8 +134,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => {
     runStart = Date.now();
     turns = 0;
-    runCostUsd = 0;
-    compactions = 0;
+    const baselineEntries = ctx.sessionManager.getEntries();
+    baselineCostUsd = sessionCostUsd(baselineEntries);
+    baselineCompactions = countCompactions(baselineEntries);
     runUi = ctx.ui;
     runTheme = ctx.ui.theme;
     stopTicker();
@@ -120,29 +147,24 @@ export default function (pi: ExtensionAPI) {
     ticker.unref?.();
   });
 
-  pi.on("turn_end", async (event) => {
+  pi.on("turn_end", async () => {
     if (runStart === undefined) return;
     turns += 1;
-    runCostUsd += event.message.usage?.cost?.total ?? 0;
     renderFooter();
-  });
-
-  pi.on("session_compact", async (event) => {
-    if (runStart === undefined) return;
-    compactions += 1;
-    runCostUsd += event.compactionEntry.usage?.cost?.total ?? 0;
   });
 
   pi.on("agent_settled", async (event, ctx) => {
     if (runStart === undefined) return;
     const elapsedMs = Date.now() - runStart;
 
+    const entries = ctx.sessionManager.getEntries();
+
     pi.appendEntry<RunTimingData>("run-timer", {
       elapsedMs,
       turns,
       aborted: event.aborted,
-      costUsd: runCostUsd,
-      compactions,
+      costUsd: sessionCostUsd(entries) - baselineCostUsd,
+      compactions: countCompactions(entries) - baselineCompactions,
     });
 
     stopTicker();
@@ -150,8 +172,8 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("run-timer", undefined);
     runStart = undefined;
     turns = 0;
-    runCostUsd = 0;
-    compactions = 0;
+    baselineCostUsd = 0;
+    baselineCompactions = 0;
     runUi = undefined;
     runTheme = undefined;
   });
@@ -160,8 +182,8 @@ export default function (pi: ExtensionAPI) {
     stopTicker();
     runStart = undefined;
     turns = 0;
-    runCostUsd = 0;
-    compactions = 0;
+    baselineCostUsd = 0;
+    baselineCompactions = 0;
     runUi = undefined;
     runTheme = undefined;
   });
