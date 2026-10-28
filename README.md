@@ -21,6 +21,8 @@ Skills and extensions are mostly created and edited by the agent — keep this s
 
 ### Skills (`agent/skills/`)
 
+- [bootstrap](agent/skills/bootstrap/SKILL.md) — prepare an empty directory for development/investigation: git, AGENTS.md with context-restore protocol, docs skeleton, untracked `repos/` for third-party clones
+
 - [duckduckgo-search](agent/skills/duckduckgo-search/SKILL.md) — web search and page content extraction via DuckDuckGo's HTML endpoint; no API key, uses only curl and awk
 - [pair](agent/skills/pair/SKILL.md) — pair programmer mode: plan first, do only what is asked, pause and ask on surprises; deep dives only on explicit request
 - [tutor](agent/skills/tutor/SKILL.md) — tutoring mode: Socratic, step-by-step teaching instead of giving answers outright
