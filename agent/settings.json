@@ -3,7 +3,7 @@
   "theme": "catppuccin-mocha",
   "defaultProvider": "routerai",
   "defaultModel": "~z-ai/glm-flash-latest",
-  "compactionThreshold": 150000,
+  "compactionThreshold": 100000,
   "packages": [],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": false,
