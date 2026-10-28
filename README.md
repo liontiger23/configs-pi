@@ -17,7 +17,7 @@ Skills and extensions are mostly created and edited by the agent — keep this s
 - [no-root-scan.ts](agent/extensions/no-root-scan.ts) — blocks bash commands that scan the filesystem root (`find /`, `du -sh /`, `rg foo /`, …), while allowing innocuous uses like `cat /etc/hosts`
 - [pin.ts](agent/extensions/pin.ts) — compaction-proof pinned context: pin text, files, or skills into the system prompt via `/pin`; stored per session in `<session-file>.pin.md`
 - [routerai-provider.ts](agent/extensions/routerai-provider.ts) — custom provider for [RouterAI](https://routerai.ru): per-provider billed pricing (cost corrected per request from the routed provider's rates), lazy per-model price refresh, `/routerai-models` price picker, ordered provider preference (`/routerai-providers`, sent as `provider.order`), context clamping for auto-compaction, GLM reasoning replay
-- [turn-timer.ts](agent/extensions/turn-timer.ts) — wall-clock run timer: measures time from prompt start until pi settles
+- [turn-timer.ts](agent/extensions/turn-timer.ts) — wall-clock run timer: measures time from prompt start until pi settles, then writes a transcript summary with elapsed time, turn count, and computed cost (total + input/output/cache split, compactions included)
 
 ### Skills (`agent/skills/`)
 

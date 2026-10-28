@@ -25,11 +25,21 @@ import { Text } from "@earendil-works/pi-tui";
  * `agent_settled` closes it. See docs/extensions.md and docs/json.md.
  */
 
+interface CostBreakdown {
+  total: number;
+  input: number;
+  output: number;
+  /** cacheRead + cacheWrite */
+  cache: number;
+}
+
 interface RunTimingData {
   elapsedMs: number;
   turns: number;
   aborted: boolean;
+  /** Total cost only (entries written before the breakdown existed). */
   costUsd?: number;
+  cost?: CostBreakdown;
   compactions?: number;
 }
 
@@ -44,28 +54,57 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${remainder}s`;
 }
 
+function formatCostNum(usd: number): string {
+  if (usd >= 1) return usd.toFixed(2);
+  return usd.toFixed(4);
+}
+
 function formatCost(usd: number): string {
-  if (usd >= 1) return `$${usd.toFixed(2)}`;
-  return `$${usd.toFixed(4)}`;
+  return `$${formatCostNum(usd)}`;
 }
 
 /** Session-attributed cost of a single entry, matching pi's own totals. */
-function entryCostUsd(entry: SessionEntry): number {
+function entryCost(entry: SessionEntry): CostBreakdown | undefined {
+  let cost:
+    | {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        total?: number;
+      }
+    | undefined;
   switch (entry.type) {
     case "message":
-      return entry.message.role === "assistant"
-        ? (entry.message.usage?.cost?.total ?? 0)
-        : 0;
+      if (entry.message.role === "assistant") cost = entry.message.usage?.cost;
+      break;
     case "compaction":
     case "usage":
-      return entry.usage?.cost?.total ?? 0;
+      cost = entry.usage?.cost;
+      break;
     default:
-      return 0;
+      return undefined;
   }
+  if (!cost) return undefined;
+  return {
+    total: cost.total ?? 0,
+    input: cost.input ?? 0,
+    output: cost.output ?? 0,
+    cache: (cost.cacheRead ?? 0) + (cost.cacheWrite ?? 0),
+  };
 }
 
-function sessionCostUsd(entries: readonly SessionEntry[]): number {
-  return entries.reduce((sum, entry) => sum + entryCostUsd(entry), 0);
+function sessionCost(entries: readonly SessionEntry[]): CostBreakdown {
+  const sum: CostBreakdown = { total: 0, input: 0, output: 0, cache: 0 };
+  for (const entry of entries) {
+    const cost = entryCost(entry);
+    if (!cost) continue;
+    sum.total += cost.total;
+    sum.input += cost.input;
+    sum.output += cost.output;
+    sum.cache += cost.cache;
+  }
+  return sum;
 }
 
 function countCompactions(entries: readonly SessionEntry[]): number {
@@ -75,7 +114,7 @@ function countCompactions(entries: readonly SessionEntry[]): number {
 export default function (pi: ExtensionAPI) {
   let runStart: number | undefined;
   let turns = 0;
-  let baselineCostUsd = 0;
+  let baselineCost: CostBreakdown | undefined;
   let baselineCompactions = 0;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let runUi: ExtensionUIContext | undefined;
@@ -117,7 +156,18 @@ export default function (pi: ExtensionAPI) {
         theme.fg("muted", formatDuration(data.elapsedMs)),
         theme.fg("dim", ` · ${turnLabel}`),
       ];
-      if (data.costUsd && data.costUsd > 0) {
+      const cost = data.cost;
+      if (cost && cost.total > 0) {
+        let costText = formatCost(cost.total);
+        // Parenthesized input/output/cache split, in fixed positions. Shown
+        // whenever any component is nonzero; a provider that reports a total
+        // without a breakdown gets total only.
+        if (cost.input > 0 || cost.output > 0 || cost.cache > 0) {
+          costText += ` (${formatCostNum(cost.input)}/${formatCostNum(cost.output)}/${formatCostNum(cost.cache)})`;
+        }
+        parts.push(theme.fg("dim", " · "));
+        parts.push(theme.fg("muted", costText));
+      } else if (data.costUsd && data.costUsd > 0) {
         parts.push(theme.fg("dim", " · "));
         parts.push(theme.fg("muted", formatCost(data.costUsd)));
       }
@@ -135,7 +185,7 @@ export default function (pi: ExtensionAPI) {
     runStart = Date.now();
     turns = 0;
     const baselineEntries = ctx.sessionManager.getEntries();
-    baselineCostUsd = sessionCostUsd(baselineEntries);
+    baselineCost = sessionCost(baselineEntries);
     baselineCompactions = countCompactions(baselineEntries);
     runUi = ctx.ui;
     runTheme = ctx.ui.theme;
@@ -158,12 +208,18 @@ export default function (pi: ExtensionAPI) {
     const elapsedMs = Date.now() - runStart;
 
     const entries = ctx.sessionManager.getEntries();
+    const cost = sessionCost(entries);
 
     pi.appendEntry<RunTimingData>("run-timer", {
       elapsedMs,
       turns,
       aborted: event.aborted,
-      costUsd: sessionCostUsd(entries) - baselineCostUsd,
+      cost: {
+        total: cost.total - (baselineCost?.total ?? 0),
+        input: cost.input - (baselineCost?.input ?? 0),
+        output: cost.output - (baselineCost?.output ?? 0),
+        cache: cost.cache - (baselineCost?.cache ?? 0),
+      },
       compactions: countCompactions(entries) - baselineCompactions,
     });
 
@@ -172,7 +228,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("run-timer", undefined);
     runStart = undefined;
     turns = 0;
-    baselineCostUsd = 0;
+    baselineCost = undefined;
     baselineCompactions = 0;
     runUi = undefined;
     runTheme = undefined;
@@ -182,7 +238,7 @@ export default function (pi: ExtensionAPI) {
     stopTicker();
     runStart = undefined;
     turns = 0;
-    baselineCostUsd = 0;
+    baselineCost = undefined;
     baselineCompactions = 0;
     runUi = undefined;
     runTheme = undefined;
