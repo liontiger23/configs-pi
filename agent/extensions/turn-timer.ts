@@ -14,7 +14,9 @@ import { Text } from "@earendil-works/pi-tui";
  *
  * - Live elapsed time is shown in the footer while the run is active.
  * - When the run settles, the total is written inline in the transcript as a
- *   durable custom entry. If the run was interrupted, the entry says so.
+ *   durable custom entry, together with the computed cost of all model turns
+ *   and any compactions that ran during the cycle. If the run was
+ *   interrupted, the entry says so.
  *
  * Lifecycle reference: `before_agent_start` opens the run window,
  * `agent_settled` closes it. See docs/extensions.md and docs/json.md.
@@ -24,6 +26,8 @@ interface RunTimingData {
   elapsedMs: number;
   turns: number;
   aborted: boolean;
+  costUsd?: number;
+  compactions?: number;
 }
 
 function formatDuration(ms: number): string {
@@ -37,9 +41,16 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${remainder}s`;
 }
 
+function formatCost(usd: number): string {
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  return `$${usd.toFixed(4)}`;
+}
+
 export default function (pi: ExtensionAPI) {
   let runStart: number | undefined;
   let turns = 0;
+  let runCostUsd = 0;
+  let compactions = 0;
   let ticker: ReturnType<typeof setInterval> | undefined;
   let runUi: ExtensionUIContext | undefined;
   let runTheme: Theme | undefined;
@@ -80,6 +91,15 @@ export default function (pi: ExtensionAPI) {
         theme.fg("muted", formatDuration(data.elapsedMs)),
         theme.fg("dim", ` · ${turnLabel}`),
       ];
+      if (data.costUsd && data.costUsd > 0) {
+        parts.push(theme.fg("dim", " · "));
+        parts.push(theme.fg("muted", formatCost(data.costUsd)));
+      }
+      if (data.compactions && data.compactions > 0) {
+        const compactionLabel =
+          data.compactions === 1 ? "1 compaction" : `${data.compactions} compactions`;
+        parts.push(theme.fg("dim", ` · ${compactionLabel}`));
+      }
       if (data.aborted) parts.push(theme.fg("warning", " · interrupted"));
       return new Text(parts.join(""), 0, 0);
     },
@@ -88,6 +108,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => {
     runStart = Date.now();
     turns = 0;
+    runCostUsd = 0;
+    compactions = 0;
     runUi = ctx.ui;
     runTheme = ctx.ui.theme;
     stopTicker();
@@ -98,10 +120,17 @@ export default function (pi: ExtensionAPI) {
     ticker.unref?.();
   });
 
-  pi.on("turn_end", async () => {
+  pi.on("turn_end", async (event) => {
     if (runStart === undefined) return;
     turns += 1;
+    runCostUsd += event.message.usage?.cost?.total ?? 0;
     renderFooter();
+  });
+
+  pi.on("session_compact", async (event) => {
+    if (runStart === undefined) return;
+    compactions += 1;
+    runCostUsd += event.compactionEntry.usage?.cost?.total ?? 0;
   });
 
   pi.on("agent_settled", async (event, ctx) => {
@@ -112,6 +141,8 @@ export default function (pi: ExtensionAPI) {
       elapsedMs,
       turns,
       aborted: event.aborted,
+      costUsd: runCostUsd,
+      compactions,
     });
 
     stopTicker();
@@ -119,6 +150,8 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("run-timer", undefined);
     runStart = undefined;
     turns = 0;
+    runCostUsd = 0;
+    compactions = 0;
     runUi = undefined;
     runTheme = undefined;
   });
@@ -127,6 +160,8 @@ export default function (pi: ExtensionAPI) {
     stopTicker();
     runStart = undefined;
     turns = 0;
+    runCostUsd = 0;
+    compactions = 0;
     runUi = undefined;
     runTheme = undefined;
   });
