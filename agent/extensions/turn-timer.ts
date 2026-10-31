@@ -175,7 +175,7 @@ export default function (pi: ExtensionAPI) {
       // Accrued cost for this turn cycle, same baseline-diff as the summary;
       // recomputed per tick so compactions and usage entries are included.
       const accrued = sessionCost(runEntries()).total - baselineCost.total;
-      if (accrued > 0) text += ` · ${formatCost(accrued)}`;
+      if (accrued > 0) text += ` ${formatCost(accrued)}`;
     }
     if (streamingSince !== undefined && streamChars > 0) {
       // Current generation rate (estimated): streamed chars / 4 divided by
@@ -187,7 +187,7 @@ export default function (pi: ExtensionAPI) {
     if (lastRate !== undefined) {
       // Frozen at its last value while tools run; refreshed as soon as the
       // next message streams.
-      text += ` · ~${formatTokPerSec(lastRate)}`;
+      text += ` ~${formatTokPerSec(lastRate)}`;
     }
     setFooter(runTheme.fg("dim", text));
   };

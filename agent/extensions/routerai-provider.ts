@@ -967,7 +967,7 @@ export default async function (pi: ExtensionAPI) {
 		const pref = providerPrefs.get(model.id);
 		ctx.ui.setStatus(
 			"routerai",
-			ctx.ui.theme.fg("dim", `₽ ${rates} · ${spent}${via ? ` · via ${via}` : ""}${pref?.length ? ` · ⭑ ${pref.join("→")}` : ""}`),
+			ctx.ui.theme.fg("dim", `${rates} · ${spent}${via ? ` via ${via}` : ""}${pref?.length ? ` ⭑ ${pref.join("→")}` : ""}`),
 		);
 	}
 
