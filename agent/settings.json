@@ -1,6 +1,6 @@
 {
   "lastChangelogVersion": "1.3.0",
-  "theme": "catppuccin-mocha",
+  "theme": "catppuccin-latte/catppuccin-mocha",
   "defaultProvider": "routerai",
   "defaultModel": "~z-ai/glm-flash-latest",
   "compactionThreshold": 120000,
