@@ -138,6 +138,8 @@ export default function (pi: ExtensionAPI) {
   // available mid-stream. Chars/4 is the standard rough approximation.
   let streamingSince: number | undefined;
   let streamChars = 0;
+  /** Last computed live rate, kept displayed while tools run (like cost). */
+  let lastRate: number | undefined;
   // Cumulative generation stats for the whole run (final summary).
   let genTokens = 0;
   let genMs = 0;
@@ -180,7 +182,12 @@ export default function (pi: ExtensionAPI) {
       // time since the first delta of this message. Denominator keeps
       // growing during a stall, so the displayed rate decays accordingly.
       const seconds = Math.max(0.1, (Date.now() - streamingSince) / 1000);
-      text += ` · ~${formatTokPerSec(streamChars / 4 / seconds)}`;
+      lastRate = streamChars / 4 / seconds;
+    }
+    if (lastRate !== undefined) {
+      // Frozen at its last value while tools run; refreshed as soon as the
+      // next message streams.
+      text += ` · ~${formatTokPerSec(lastRate)}`;
     }
     setFooter(runTheme.fg("dim", text));
   };
@@ -237,6 +244,7 @@ export default function (pi: ExtensionAPI) {
     runTheme = ctx.ui.theme;
     streamingSince = undefined;
     streamChars = 0;
+    lastRate = undefined;
     genTokens = 0;
     genMs = 0;
     stopTicker();
@@ -315,6 +323,7 @@ export default function (pi: ExtensionAPI) {
     baselineCompactions = 0;
     streamingSince = undefined;
     streamChars = 0;
+    lastRate = undefined;
     genTokens = 0;
     genMs = 0;
     runEntries = undefined;
@@ -330,6 +339,7 @@ export default function (pi: ExtensionAPI) {
     baselineCompactions = 0;
     streamingSince = undefined;
     streamChars = 0;
+    lastRate = undefined;
     genTokens = 0;
     genMs = 0;
     runEntries = undefined;
