@@ -219,7 +219,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (data.tokPerSec && data.tokPerSec > 0) {
         parts.push(theme.fg("dim", " · "));
-        parts.push(theme.fg("muted", `${formatTokPerSec(data.tokPerSec)} generating`));
+        parts.push(theme.fg("muted", formatTokPerSec(data.tokPerSec)));
       }
       if (data.aborted) parts.push(theme.fg("warning", " · interrupted"));
       return new Text(parts.join(""), 0, 0);
