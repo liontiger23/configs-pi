@@ -13,11 +13,17 @@ import { Text } from "@earendil-works/pi-tui";
  * Pi settles (no more automatic work: model turns, tool calls, retries,
  * compaction, and queued messages all included).
  *
- * - Live elapsed time is shown in the footer while the run is active.
+ * - Live elapsed time is shown in the footer while the run is active, plus
+ *   live token generation throughput (output tokens / second of streaming)
+ *   while the model is producing tokens. OpenAI-compatible providers such as
+ *   RouterAI only report usage on the final chunk, so the live rate is an
+ *   estimate from streamed characters (~4 chars/token); the settled summary
+ *   uses exact final usage instead.
  * - When the run settles, the total is written inline in the transcript as a
  *   durable custom entry, together with the computed cost of the run (model
  *   turns, compactions, and any other session-attributed usage that accrued
- *   during the cycle) and the number of compactions, both derived by diffing
+ *   during the cycle), the number of compactions, and the average generation
+ *   rate over time actually spent streaming, all derived by diffing
  *   session-entry totals against a baseline taken at run start. If the run
  *   was interrupted, the entry says so.
  *
@@ -41,6 +47,12 @@ interface RunTimingData {
   costUsd?: number;
   cost?: CostBreakdown;
   compactions?: number;
+  /** Output tokens generated across all streamed assistant messages. */
+  genTokens?: number;
+  /** Time spent streaming those tokens (excludes tool execution and network gaps between messages). */
+  genMs?: number;
+  /** Average generation rate over genMs. */
+  tokPerSec?: number;
 }
 
 function formatDuration(ms: number): string {
@@ -111,11 +123,24 @@ function countCompactions(entries: readonly SessionEntry[]): number {
   return entries.filter((entry) => entry.type === "compaction").length;
 }
 
+function formatTokPerSec(tokPerSec: number): string {
+  return `${Math.round(tokPerSec)} tok/s`;
+}
+
 export default function (pi: ExtensionAPI) {
   let runStart: number | undefined;
   let turns = 0;
   let baselineCost: CostBreakdown | undefined;
   let baselineCompactions = 0;
+  // Live generation-rate tracking for the currently streaming message.
+  // Estimated from streamed chars (~4 chars/token): OpenAI-compatible
+  // providers report usage only on the final chunk, so nothing exact is
+  // available mid-stream. Chars/4 is the standard rough approximation.
+  let streamingSince: number | undefined;
+  let streamChars = 0;
+  // Cumulative generation stats for the whole run (final summary).
+  let genTokens = 0;
+  let genMs = 0;
   /** Session entries accessor for the active run, for footer cost updates. */
   let runEntries: (() => readonly SessionEntry[]) | undefined;
   let ticker: ReturnType<typeof setInterval> | undefined;
@@ -149,6 +174,13 @@ export default function (pi: ExtensionAPI) {
       // recomputed per tick so compactions and usage entries are included.
       const accrued = sessionCost(runEntries()).total - baselineCost.total;
       if (accrued > 0) text += ` · ${formatCost(accrued)}`;
+    }
+    if (streamingSince !== undefined && streamChars > 0) {
+      // Current generation rate (estimated): streamed chars / 4 divided by
+      // time since the first delta of this message. Denominator keeps
+      // growing during a stall, so the displayed rate decays accordingly.
+      const seconds = Math.max(0.1, (Date.now() - streamingSince) / 1000);
+      text += ` · ~${formatTokPerSec(streamChars / 4 / seconds)}`;
     }
     setFooter(runTheme.fg("dim", text));
   };
@@ -185,6 +217,10 @@ export default function (pi: ExtensionAPI) {
           data.compactions === 1 ? "1 compaction" : `${data.compactions} compactions`;
         parts.push(theme.fg("dim", ` · ${compactionLabel}`));
       }
+      if (data.tokPerSec && data.tokPerSec > 0) {
+        parts.push(theme.fg("dim", " · "));
+        parts.push(theme.fg("muted", `${formatTokPerSec(data.tokPerSec)} generating`));
+      }
       if (data.aborted) parts.push(theme.fg("warning", " · interrupted"));
       return new Text(parts.join(""), 0, 0);
     },
@@ -199,12 +235,38 @@ export default function (pi: ExtensionAPI) {
     runEntries = () => ctx.sessionManager.getEntries();
     runUi = ctx.ui;
     runTheme = ctx.ui.theme;
+    streamingSince = undefined;
+    streamChars = 0;
+    genTokens = 0;
+    genMs = 0;
     stopTicker();
 
     renderFooter();
     // Refresh the footer about every second while the run is active.
     ticker = setInterval(renderFooter, 1000);
     ticker.unref?.();
+  });
+
+  // Streaming deltas: estimate the live generation rate by counting streamed
+  // characters. The 1s footer ticker reads this; no per-delta rendering.
+  pi.on("message_update", async (event) => {
+    if (runStart === undefined) return;
+    const e = event.assistantMessageEvent;
+    if (e.type === "text_delta" || e.type === "thinking_delta" || e.type === "toolcall_delta") {
+      if (streamingSince === undefined) streamingSince = Date.now();
+      streamChars += e.delta.length;
+    }
+  });
+
+  // A message finished streaming: fold its stats into the run totals.
+  pi.on("message_end", async (event) => {
+    if (runStart === undefined) return;
+    if (streamingSince !== undefined) {
+      genMs += Math.max(0, Date.now() - streamingSince);
+      streamingSince = undefined;
+      streamChars = 0;
+    }
+    if (event.message.role === "assistant") genTokens += event.message.usage?.output ?? 0;
   });
 
   pi.on("turn_end", async () => {
@@ -220,6 +282,14 @@ export default function (pi: ExtensionAPI) {
     const entries = ctx.sessionManager.getEntries();
     const cost = sessionCost(entries);
 
+    // Final generation stats: exact output tokens from message usage, time
+    // spent streaming (first delta → message end, tool execution excluded),
+    // and the average rate over that streaming time. An in-flight message is
+    // folded in with its elapsed streaming time (token count unknown mid-stream).
+    const totalGenTokens = genTokens;
+    const totalGenMs = genMs + (streamingSince !== undefined ? Math.max(0, Date.now() - streamingSince) : 0);
+    const tokPerSec = totalGenMs > 0 ? totalGenTokens / (totalGenMs / 1000) : 0;
+
     pi.appendEntry<RunTimingData>("run-timer", {
       elapsedMs,
       turns,
@@ -231,6 +301,9 @@ export default function (pi: ExtensionAPI) {
         cache: cost.cache - (baselineCost?.cache ?? 0),
       },
       compactions: countCompactions(entries) - baselineCompactions,
+      genTokens: totalGenTokens,
+      genMs: totalGenMs,
+      tokPerSec,
     });
 
     stopTicker();
@@ -240,6 +313,10 @@ export default function (pi: ExtensionAPI) {
     turns = 0;
     baselineCost = undefined;
     baselineCompactions = 0;
+    streamingSince = undefined;
+    streamChars = 0;
+    genTokens = 0;
+    genMs = 0;
     runEntries = undefined;
     runUi = undefined;
     runTheme = undefined;
@@ -251,6 +328,10 @@ export default function (pi: ExtensionAPI) {
     turns = 0;
     baselineCost = undefined;
     baselineCompactions = 0;
+    streamingSince = undefined;
+    streamChars = 0;
+    genTokens = 0;
+    genMs = 0;
     runEntries = undefined;
     runUi = undefined;
     runTheme = undefined;
