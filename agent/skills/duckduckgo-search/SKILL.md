@@ -1,30 +1,31 @@
 ---
 name: duckduckgo-search
-description: Web search and page content extraction via DuckDuckGo's HTML endpoint (no API key required). Use for searching documentation, facts, news, or any web content. Also fetches page content from URLs. Uses curl and awk only — zero extra dependencies.
-allowed-tools: bash curl
+description: Web search via DuckDuckGo's HTML endpoint and page-to-text extraction via w3m. Use for searching documentation, facts, news, or any web content, and for reading pages as clean text instead of raw HTML. Search parser is Python 3 stdlib; no API key needed.
+allowed-tools: bash
 ---
 
 # DuckDuckGo Search & Fetch
 
 Search the web via DuckDuckGo's anonymous HTML endpoint, then optionally fetch and read page content.
 
-## Setup
-
-No setup required. Relies on `curl` and `awk`.
+Run the scripts relative to this skill directory.
 
 ## Search
 
 ```bash
-./scripts/search.sh "your search query" [count]
+./scripts/search.py "your search query" [count]
 ```
 
 - `count` is optional, defaults to 10 results
 - Returns numbered results with title, decoded URL, and snippet
+- Python 3 stdlib only (urllib, re, html)
 
 **Example:**
 ```bash
-./scripts/search.sh "effect typescript library" 5
+./scripts/search.py "effect typescript library" 5
 ```
+
+**On failure:** the script retries once and then exits 1 with an explicit error. That failure means rate limiting or a markup change — it is **not** evidence that no results exist. Don't retry in a tight loop; treat DDG as temporarily unavailable and say so.
 
 ## Fetch Page Content
 
@@ -32,11 +33,9 @@ No setup required. Relies on `curl` and `awk`.
 ./scripts/fetch.sh <url>
 ```
 
-- Fetches the URL and renders it as clean structured text
-- Uses `w3m -dump` (preferred) or `lynx -dump` for proper HTML rendering with heading/section structure preserved
-- Strips navigation, sidebars, scripts, styles — only visible content remains
-- Follows redirects, 30 second timeout
-- Output limited to 500 lines
+- Fetches the URL and renders it as clean structured text via `w3m -dump -T text/html`
+- Follows redirects, 30 second timeout, output limited to 500 lines
+- Fails loudly on HTTP errors, timeouts, or empty responses
 
 **Example:**
 ```bash
@@ -45,16 +44,15 @@ No setup required. Relies on `curl` and `awk`.
 
 ## Typical Workflow
 
-1. **Search**: `./scripts/search.sh "topic"` → get relevant URLs
+1. **Search**: `./scripts/search.py "topic"` → get relevant URLs
 2. **Fetch**: `./scripts/fetch.sh "selected-url"` → read the actual page content
 3. **Synthesize**: combine search results and page content for your answer
 
 ## How It Works
 
-- DuckDuckGo's HTML endpoint at `https://html.duckduckgo.com/html/` provides search results without requiring any API key
-- The `uddg` redirect URLs embedded in the HTML are automatically decoded back to real destination URLs
+- DuckDuckGo's HTML endpoint at `https://html.duckduckgo.com/html/` provides search results without requiring any API key; the `uddg` redirect URLs are decoded back to real destination URLs
+- The endpoint is undocumented and best-effort — it can rate-limit or change markup without notice, which is why failures are loud rather than silent
 - For page content, `w3m -dump` renders HTML into structured plain text (headings separated by blank lines, paragraphs indented), which is ideal for LLM consumption compared to raw HTML
-- Fetch falls back to `lynx -dump`, then to crude tag-stripping if neither is available
 
 ## GitHub Access — Prefer `gh` CLI
 
