@@ -1,10 +1,10 @@
 ---
-name: duckduckgo-search
+name: web-search
 description: Web search via DuckDuckGo's HTML endpoint and page-to-text extraction via w3m. Use for searching documentation, facts, news, or any web content, and for reading pages as clean text instead of raw HTML. Search parser is Python 3 stdlib; no API key needed.
 allowed-tools: bash
 ---
 
-# DuckDuckGo Search & Fetch
+# Web Search & Fetch
 
 Search the web via DuckDuckGo's anonymous HTML endpoint, then optionally fetch and read page content.
 
