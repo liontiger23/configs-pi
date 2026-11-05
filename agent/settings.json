@@ -7,5 +7,6 @@
   "packages": [],
   "defaultThinkingLevel": "high",
   "hideThinkingBlock": false,
+  "fullscreenCopyOnSelect": false,
   "routerai": {}
 }
