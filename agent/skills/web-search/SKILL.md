@@ -25,7 +25,37 @@ Run the scripts relative to this skill directory.
 ./scripts/search.py "effect typescript library" 5
 ```
 
-**On failure:** the script retries once and then exits 1 with an explicit error. That failure means rate limiting or a markup change — it is **not** evidence that no results exist. Don't retry in a tight loop; treat DDG as temporarily unavailable and say so.
+**On failure:** the script retries once and then exits 1 with an explicit error. That failure means rate limiting or a markup change — it is **not** evidence that no results exist. Don't retry in a tight loop; use a fallback below and say so.
+
+## Fallbacks
+
+When DDG is unavailable or the target site has an official API, prefer these keyless options:
+
+**Site-specific official APIs** (stable, structured, keyless):
+
+```bash
+# Hacker News — tech/industry discussion
+curl -fsS "https://hn.algolia.com/api/v1/search?query=QUERY&hitsPerPage=10"
+
+# Wikipedia — encyclopedic lookups
+curl -fsS "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=QUERY&format=json&srlimit=10"
+
+# Stack Overflow
+curl -fsS --compressed "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=QUERY&site=stackoverflow&pagesize=10"
+```
+
+**General search via Exa MCP** (keyless, undocumented rate limit — use when DDG fails):
+
+```bash
+curl -fsS --max-time 30 -X POST "https://mcp.exa.ai/mcp" \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-03-26" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search_exa","arguments":{"query":"QUERY","numResults":5}}}' \
+  | grep -oE '"text":"[^"]*"' | head -1
+```
+
+- Tavily (1,000 credits/mo) and Brave ($5/mo renewing credits) offer documented free tiers, but require signup and key storage — only worth it if keyless options prove insufficient.
+- For pages that w3m renders poorly (JS-heavy, bot-blocked), try Jina Reader: `curl -fsS "https://r.jina.ai/<url>"` (keyless, rate-limited).
 
 ## Fetch Page Content
 
@@ -39,7 +69,7 @@ Run the scripts relative to this skill directory.
 
 **Example:**
 ```bash
-./scripts/fetch.sh "https://en.wikipedia.org/wiki/Effect_(software)"
+./scripts/fetch.sh "https://en.wikipedia.org/wiki/DuckDuckGo"
 ```
 
 ## Typical Workflow
