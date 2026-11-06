@@ -55,7 +55,8 @@ function unquote(word: string): string {
 
 // True if a path argument points at the filesystem root ("/", "//", or
 // quoted/trimmed variants). Relative paths and real directories are allowed.
-function isFilesystemRoot(value: unknown): boolean {
+// (Exported for tests.)
+export function isFilesystemRoot(value: unknown): boolean {
 	if (typeof value !== "string") return false;
 	const trimmed = value.trim().replace(/^["']|["']$/g, "");
 	return /^\/{1,2}$/.test(trimmed);
@@ -82,7 +83,9 @@ const rootScanRules: RegExp[] = [
 	new RegExp(String.raw`^(?:rg|fd|locate)\s+(?:-[A-Za-z]+\s+)*\S*\s*${ROOT}(?:\s|$)`),
 ];
 
-function findRootScan(command: string): string | undefined {
+// Returns the source of the first matching root-scan rule, if any.
+// (Exported for tests.)
+export function findRootScan(command: string): string | undefined {
 	const stripped = command.replace(HEREDOC, "");
 	for (const rawSegment of stripped.split(SEGMENT_SPLIT)) {
 		const segment = rawSegment.replace(WRAPPERS, "").trimStart();
@@ -102,7 +105,9 @@ interface SelfMatch {
 	pattern: string;
 }
 
-function findSelfMatch(command: string): SelfMatch | undefined {
+// Returns the first pgrep/pkill -f invocation whose pattern matches the
+// command text itself, i.e. one that will self-match. (Exported for tests.)
+export function findSelfMatch(command: string): SelfMatch | undefined {
 	const stripped = command.replace(HEREDOC, "");
 	for (const rawSegment of stripped.split(SEGMENT_SPLIT)) {
 		const segment = rawSegment.replace(WRAPPERS, "").trimStart();

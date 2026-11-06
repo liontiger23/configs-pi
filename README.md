@@ -38,3 +38,4 @@ Skills and extensions are mostly created and edited by the agent — keep this s
 
 - Runtime files (`agent/sessions/`, `agent/auth.json`, `agent/models-store.json`, `agent/trust.json`, `agent/npm/`) live inside the repository but are gitignored, see `.gitignore`
 - `agent/auth.json` contains API keys and OAuth tokens — never commit it
+- Extension tests live in `agent/tests/` and run against the real extension files via the jiti loader bundled with pi: `node --import ~/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti-register.mjs agent/tests/<name>.test.ts`
