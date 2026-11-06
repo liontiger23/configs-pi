@@ -14,7 +14,7 @@ Skills and extensions are mostly created and edited by the agent — keep this s
 
 ### Extensions (`agent/extensions/`)
 
-- [no-root-scan.ts](agent/extensions/no-root-scan.ts) — blocks bash commands that scan the filesystem root (`find /`, `du -sh /`, `rg foo /`, …), while allowing innocuous uses like `cat /etc/hosts`
+- [bash-guard.ts](agent/extensions/bash-guard.ts) — blocks dangerous bash patterns: filesystem-root scans (`find /`, `du -sh /`, `rg foo /`, …) and self-matching `pgrep`/`pkill -f`, whose pattern matches its own command line (silent wait loops that never end); suggests the bracket trick or `kill -0 <pid>`
 - [pin.ts](agent/extensions/pin.ts) — compaction-proof pinned context: pin text, files, or skills into the system prompt via `/pin`; stored per session in `<session-file>.pin.md`
 - [routerai-provider.ts](agent/extensions/routerai-provider.ts) — custom provider for [RouterAI](https://routerai.ru): per-provider billed pricing (cost corrected per request from the routed provider's rates), lazy per-model price refresh, `/routerai-models` price picker, ordered provider preference (`/routerai-providers`, sent as `provider.order`), context clamping for auto-compaction, GLM reasoning replay
 - [turn-timer.ts](agent/extensions/turn-timer.ts) — wall-clock run timer: measures time from prompt start until pi settles, shows live elapsed time, cost, and estimated generation tok/s in the footer, then writes a transcript summary with elapsed time, turn count, cost (total + input/output/cache split, compactions included), and average generation rate over streaming time
