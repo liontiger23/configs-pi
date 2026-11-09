@@ -51,6 +51,12 @@
  *     duplicated as `reasoning_content` for GLM chat templates. Toggle via
  *     settings.json `gptplus5.reasoningReplay`: "duplicate" (default),
  *     "rename", or "off".
+ *   - `/gptplus5-models` opens a provider-scoped, searchable model picker
+ *     with prices (like `/routerai-models`): price sorts (ctrl+s), a catalog
+ *     refresh (ctrl+r) and capability filter tokens (free/cheap/big/current).
+ *     Provider-scoped because pi's built-in /model search matches tokens as
+ *     subsequences of "provider id" — typing "gptplus5 glm" there also hits
+ *     e.g. MiniMax ("gptplus5" supplies g…l, "minimax" the m).
  *   - The footer shows $/Mtok rates for the current model, session spend,
  *     and the key's remaining budget. `/gptplus5-refresh` force-refreshes
  *     the catalog and the balance.
@@ -63,9 +69,20 @@
 import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+	Container,
+	Input,
+	matchesKey,
+	type SelectItem,
+	SelectList,
+	Text,
+	truncateToWidth,
+	fuzzyFilter,
+} from "@earendil-works/pi-tui";
 
 interface PricingEntry {
 	model_name: string;
@@ -565,6 +582,35 @@ function updateFooter(ctx: ExtensionContext) {
 	);
 }
 
+function fmtCtx(model: GptPlus5Model): string {
+	const real = model.rawContextWindow ?? model.contextWindow;
+	const ctx = real >= 1000 ? `${Math.round(real / 1000)}k` : `${real}`;
+	if (model.contextWindow < real) {
+		const clamped = model.contextWindow >= 1000 ? `${Math.round(model.contextWindow / 1000)}k` : `${model.contextWindow}`;
+		return `${ctx} (♻${clamped})`;
+	}
+	return ctx;
+}
+
+interface PickerItem extends SelectItem {
+	model: GptPlus5Model;
+}
+
+interface CapabilityFilter {
+	token: string;
+	test: (m: GptPlus5Model) => boolean;
+}
+
+interface SortOption {
+	id: "relevance" | "name" | "input" | "output";
+	label: string;
+	/** undefined = keep the incoming (fuzzy match-quality) order. */
+	cmp?: (a: GptPlus5Model, b: GptPlus5Model) => number;
+}
+
+const SORT_KEY = "ctrl+s";
+const REFRESH_KEY = "ctrl+r";
+
 export default async function (pi: ExtensionAPI) {
 	// ── GLM reasoning replay (see header comment) ──
 
@@ -648,6 +694,215 @@ export default async function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await refreshBalance(ctx, true);
 			await refreshPrices(ctx, true);
+		},
+	});
+
+	// ── /gptplus5-models: provider-scoped, searchable price picker ──
+	// Scoped to GPTPlus5 models only — pi's built-in /model search can't do
+	// "provider first, then model name" because its subsequence matching lets
+	// the provider name satisfy model-name tokens (see header comment).
+
+	pi.registerCommand("gptplus5-models", {
+		description: "Searchable GPTPlus5 model picker with prices",
+		handler: async (_args, ctx) => {
+			const models = () =>
+				ctx.modelRegistry.getAll().filter(
+					(m): m is GptPlus5Model => m.provider === PROVIDER_ID,
+				);
+			if (models().length === 0) {
+				ctx.ui.notify("No GPTPlus5 models loaded yet — try /gptplus5-refresh", "warning");
+				return;
+			}
+
+			const current = ctx.model;
+			let sortIndex = 0;
+
+			const SORTS: SortOption[] = [
+				// "best match": preserves fuzzyFilter's ranking; catalog order when
+				// the query is empty.
+				{ id: "relevance", label: "best match" },
+				{ id: "name", label: "name", cmp: (a, b) => a.name.localeCompare(b.name) },
+				{ id: "input", label: "input price ↑", cmp: (a, b) => a.cost.input - b.cost.input || a.name.localeCompare(b.name) },
+				{ id: "output", label: "output price ↑", cmp: (a, b) => a.cost.output - b.cost.output || a.name.localeCompare(b.name) },
+			];
+
+			const FILTERS: CapabilityFilter[] = [
+				{ token: "free", test: (m) => m.cost.output === 0 },
+				{ token: "cheap", test: (m) => m.cost.output > 0 && m.cost.output * 1_000_000 <= 5 },
+				{ token: "big", test: (m) => (m.rawContextWindow ?? m.contextWindow) >= 256_000 },
+				{
+					token: "current",
+					test: (m) => (current ? current.provider === m.provider && current.id === m.id : false),
+				},
+			];
+			const filtersHint = FILTERS.map((f) => f.token).join(" ");
+
+			// value: model id (search key), label: display name, description:
+			// prices + context window + tiered-billing badge.
+			const byId = new Map<string, PickerItem>();
+			function rebuildById() {
+				byId.clear();
+				for (const m of models()) {
+					byId.set(m.id, {
+						model: m,
+						value: m.id,
+						label: m.name,
+						description:
+							`${m.tieredBilling ? "≈" : ""}in ${fmtPrice(m.cost.input * 1_000_000)}`
+							+ ` / out ${fmtPrice(m.cost.output * 1_000_000)}`
+							+ ` / cache ${fmtPrice(m.cost.cacheRead * 1_000_000)} $/Mtok`
+							+ ` · ctx ${fmtCtx(m)}`,
+					});
+				}
+			}
+			rebuildById();
+
+			const result = await ctx.ui.custom<GptPlus5Model | null>(
+				(tui, theme, kb, done) => {
+					const container = new Container();
+					container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+					container.addChild(new Text(theme.fg("accent", theme.bold("GPTPlus5 Models — prices in $/Mtok"))));
+
+					const searchInput = new Input({ prompt: "Search: " });
+					container.addChild(searchInput);
+
+					const selectTheme = {
+						selectedPrefix: (text: string) => theme.fg("accent", text),
+						selectedText: (text: string) => theme.fg("accent", text),
+						description: (text: string) => theme.fg("muted", text),
+						scrollInfo: (text: string) => theme.fg("dim", text),
+						noMatch: (text: string) => theme.fg("warning", text),
+					};
+					const listLayout = { minPrimaryColumnWidth: 36, maxPrimaryColumnWidth: 42 };
+
+					// The list is rebuilt on every filter/sort change
+					// (SelectList's item accessors are private).
+					const listContainer = new Container();
+					const countLine = new Text("", 0, 0);
+					const statusLine = new Text("", 0, 0);
+					const sortStatus = new Text("", 0, 0);
+
+					let selectList = new SelectList([], 10, selectTheme, listLayout);
+
+					function makeList(filtered: PickerItem[], keepSelection: boolean) {
+						const previousId = keepSelection ? selectList.getSelectedItem()?.value : undefined;
+						selectList = new SelectList(filtered, 10, selectTheme, listLayout);
+						selectList.onSelect = (item) => done((item as PickerItem).model);
+						selectList.onCancel = () => done(null);
+						if (previousId) {
+							const index = filtered.findIndex((item) => item.value === previousId);
+							if (index > 0) selectList.setSelectedIndex(index);
+						}
+						listContainer.clear();
+						listContainer.addChild(selectList);
+					}
+
+					function setSortStatus() {
+						sortStatus.setText(theme.fg("dim", `  sort: ${SORTS[sortIndex].label} · ${SORT_KEY} cycle`));
+					}
+
+					function computeFiltered(): PickerItem[] {
+						const raw = searchInput.getValue();
+						let stripped = raw;
+						let list = [...byId.values()];
+
+						for (const f of FILTERS) {
+							if (stripped.includes(f.token)) {
+								list = list.filter((item) => f.test(item.model));
+								stripped = stripped.split(f.token).join(" ");
+							}
+						}
+						stripped = stripped.replace(/\s+/g, " ").trim();
+
+						// fuzzyFilter sorts by match quality (best first)
+						let filtered: PickerItem[] = stripped
+							? fuzzyFilter(list, stripped, (item) => `${item.value} ${item.label}`)
+							: list;
+
+						const cmp = SORTS[sortIndex].cmp;
+						if (cmp) filtered = filtered.slice().sort((a, b) => cmp(a.model, b.model));
+						return filtered;
+					}
+
+					function refresh(keepSelection: boolean) {
+						const filtered = computeFiltered();
+						makeList(filtered, keepSelection);
+						setSortStatus();
+						countLine.setText(theme.fg("dim", `  ${filtered.length} / ${byId.size} models`));
+					}
+
+					function cycleSort() {
+						sortIndex = (sortIndex + 1) % SORTS.length;
+						refresh(true);
+					}
+
+					// ctrl+r: re-fetch the catalog (one /api/pricing request refreshes
+					// every model) and rebuild the list in place.
+					let refreshing = false;
+					async function refreshCatalog() {
+						if (refreshing) return;
+						refreshing = true;
+						statusLine.setText(theme.fg("warning", "  ⟳ refreshing catalog…"));
+						tui.requestRender();
+						try {
+							await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true });
+							rebuildById();
+							statusLine.setText(theme.fg("dim", `  ⟳ refreshed ${byId.size} models`));
+						} catch (error) {
+							statusLine.setText(theme.fg("warning", `  ⟳ refresh failed (${error instanceof Error ? error.message : String(error)})`));
+						} finally {
+							refreshing = false;
+						}
+						refresh(true);
+						tui.requestRender();
+					}
+
+					container.addChild(countLine);
+					container.addChild(listContainer);
+					container.addChild(statusLine);
+					container.addChild(sortStatus);
+					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${SORT_KEY} sort · ${REFRESH_KEY} refresh · filters: ${filtersHint}`)));
+
+					refresh(false);
+
+					return {
+						render(width: number) {
+							return container.render(width);
+						},
+						invalidate() {
+							container.invalidate();
+						},
+						handleInput(data: string) {
+							// Route list keys (arrows/enter/esc) to the list, sort/refresh
+							// combos to their actions, everything else (typing,
+							// backspace, …) to the search input.
+							if (
+								kb.matches(data, "tui.select.up") ||
+								kb.matches(data, "tui.select.down") ||
+								kb.matches(data, "tui.select.confirm") ||
+								kb.matches(data, "tui.select.cancel")
+							) {
+								selectList.handleInput(data);
+							} else if (matchesKey(data, REFRESH_KEY)) {
+								void refreshCatalog();
+							} else if (matchesKey(data, SORT_KEY)) {
+								cycleSort();
+							} else {
+								searchInput.handleInput(data);
+								refresh(false);
+							}
+							tui.requestRender();
+						},
+					};
+				},
+			);
+
+			if (!result) return;
+
+			const success = await pi.setModel(result);
+			if (!success) {
+				ctx.ui.notify(`Could not switch to ${result.provider}/${result.id} — no API key configured`, "warning");
+			}
 		},
 	});
 
