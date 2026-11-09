@@ -375,11 +375,13 @@ function toModelDef(m: PricingEntry, groupRatio: number): GptPlus5Model {
 		name: m.model_name,
 		reasoning: false,
 		input: ["text"],
+		// pi-ai's calculateCost treats model.cost as $/Mtok and divides by 1e6
+		// itself — store rates in this scale, NOT per-token.
 		cost: {
-			input: inputPerMtok / 1_000_000,
-			output: outputPerMtok / 1_000_000,
-			cacheRead: cacheReadPerMtok / 1_000_000,
-			cacheWrite: cacheWritePerMtok / 1_000_000,
+			input: inputPerMtok,
+			output: outputPerMtok,
+			cacheRead: cacheReadPerMtok,
+			cacheWrite: cacheWritePerMtok,
 		},
 		contextWindow,
 		rawContextWindow: realContextWindow,
@@ -561,9 +563,9 @@ function updateFooter(ctx: ExtensionContext) {
 		return;
 	}
 	const rates =
-		`${model.tieredBilling ? "≈" : ""}${fmtPrice(model.cost.input * 1_000_000)}/`
-		+ `${fmtPrice(model.cost.output * 1_000_000)}/`
-		+ `${fmtPrice(model.cost.cacheRead * 1_000_000)} $/Mtok`;
+		`${model.tieredBilling ? "≈" : ""}${fmtPrice(model.cost.input)}/`
+		+ `${fmtPrice(model.cost.output)}/`
+		+ `${fmtPrice(model.cost.cacheRead)} $/Mtok`;
 	const cost = sessionCost(ctx);
 	const split =
 		cost.input > 0 || cost.output > 0 || cost.cache > 0
@@ -728,7 +730,7 @@ export default async function (pi: ExtensionAPI) {
 
 			const FILTERS: CapabilityFilter[] = [
 				{ token: "free", test: (m) => m.cost.output === 0 },
-				{ token: "cheap", test: (m) => m.cost.output > 0 && m.cost.output * 1_000_000 <= 5 },
+				{ token: "cheap", test: (m) => m.cost.output > 0 && m.cost.output <= 5 },
 				{ token: "big", test: (m) => (m.rawContextWindow ?? m.contextWindow) >= 256_000 },
 				{
 					token: "current",
@@ -748,9 +750,9 @@ export default async function (pi: ExtensionAPI) {
 						value: m.id,
 						label: m.name,
 						description:
-							`${m.tieredBilling ? "≈" : ""}in ${fmtPrice(m.cost.input * 1_000_000)}`
-							+ ` / out ${fmtPrice(m.cost.output * 1_000_000)}`
-							+ ` / cache ${fmtPrice(m.cost.cacheRead * 1_000_000)} $/Mtok`
+							`${m.tieredBilling ? "≈" : ""}in ${fmtPrice(m.cost.input)}`
+							+ ` / out ${fmtPrice(m.cost.output)}`
+							+ ` / cache ${fmtPrice(m.cost.cacheRead)} $/Mtok`
 							+ ` · ctx ${fmtCtx(m)}`,
 					});
 				}
