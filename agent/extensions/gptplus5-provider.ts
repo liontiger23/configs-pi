@@ -42,9 +42,11 @@
  *       GET /v1/dashboard/billing/usage → total_usage = usedQuota in
  *           dollars × 100 (cents)
  *     Remaining budget = hard_limit_usd − total_usage/100, refreshed at
- *     startup and after each turn (TTL-debounced via settings
- *     `gptplus5.balanceRefreshSeconds`, default 30; 0 = every turn) and
- *     shown in the footer. This site displays quotas as USD
+ *     startup, on model select and after each turn (TTL-debounced via
+ *     settings `gptplus5.balanceRefreshSeconds`, default 30; 0 = every
+ *     turn) and shown in the footer. The key is resolved via
+ *     modelRegistry.getApiKeyForProvider (request-path captures kept as
+ *     fallback). This site displays quotas as USD
  *     (`quota_display_type: "USD"`), so amounts are dollars.
  *   - GLM reasoning replay (`before_provider_request`): the same GLM
  *     quirk as on RouterAI (pi issue #10262) — replayed `reasoning` is
@@ -478,7 +480,20 @@ async function refreshBalance(
 	ctx: ExtensionContext,
 	force: boolean,
 ): Promise<void> {
-	if (!apiKey || balanceFetchInFlight) return;
+	if (balanceFetchInFlight) return;
+	if (!apiKey) {
+		// Resolve the stored credential through the official registry API so
+		// the balance works at startup and right after a model switch —
+		// without waiting for a request to fire (resolve/before_provider_headers
+		// only run in the request path).
+		try {
+			const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+			if (key) apiKey = key;
+		} catch {
+			// provider auth not configured yet
+		}
+		if (!apiKey) return;
+	}
 	const ttl = getBalanceRefreshSeconds() * 1000;
 	if (!force && ttl > 0 && Date.now() - lastBalanceFetchAt < ttl) return;
 	balanceFetchInFlight = true;
@@ -574,15 +589,14 @@ function updateFooter(ctx: ExtensionContext) {
 			? ` (${cost.input.toFixed(3)}/${cost.output.toFixed(3)}/${cost.cache.toFixed(3)})`
 			: "";
 	const spent = `$${cost.total.toFixed(3)}${split}`;
-	let budget = "";
-	if (balance) {
-		budget = balance.unlimited || balance.remaining === undefined
+	const budget = !balance
+		? ""
+		: balance.unlimited || balance.remaining === undefined
 			? " · left ∞"
-			: ` · left $${balance.remaining!.toFixed(2)}`;
-	}
+			: ` · left $${balance.remaining.toFixed(2)}`;
 	ctx.ui.setStatus(
 		"gptplus5",
-		ctx.ui.theme.fg("dim", `${rates} · ${spent}${budget} · group ${getGroup()}`),
+		ctx.ui.theme.fg("dim", `${rates} · ${spent}${budget}`),
 	);
 }
 
@@ -987,6 +1001,9 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("model_select", async (_event, ctx) => {
 		updateFooter(ctx);
+		// TTL-debounced: covers sessions where no turn has completed yet
+		// (balance would otherwise stay hidden until the first turn_end).
+		void refreshBalance(ctx, false);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
