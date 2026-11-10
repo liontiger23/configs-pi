@@ -29,6 +29,7 @@ import {
 	AUTH_KEY,
 	buildConfig,
 	discoverChatId,
+	markdownToTelegramHtml,
 	resolveKey,
 	sendDocument,
 	sendText,
@@ -40,8 +41,8 @@ import {
 
 const NotifyParams = Type.Object({
 	action: StringEnum(["send", "status"] as const, { description: "send = deliver text to the user's Telegram; status = show configuration state" }),
-	text: Type.Optional(Type.String({ description: "Message body (for action=send). Plain text by default; use parseMode for formatting." })),
-	parseMode: Type.Optional(StringEnum(["none", "HTML", "MarkdownV2"] as const, { description: "Formatting for the message. Default: none (plain text). For HTML use <b>, <i>, <code>, <a href=\"...\">." })),
+	text: Type.Optional(Type.String({ description: "Message body (for action=send). GitHub-style markdown by default (bold, code, links, headers — converted automatically); use parseMode to override." })),
+	parseMode: Type.Optional(StringEnum(["markdown", "none", "HTML"] as const, { description: "markdown (default): GitHub-style markdown converted to Telegram HTML. none: plain text, no conversion. HTML: raw Telegram HTML (<b>, <i>, <code>, <pre>, <a href>)." })),
 	silent: Type.Optional(Type.Boolean({ description: "Deliver without notification sound (default false)" })),
 	asDocument: Type.Optional(Type.Boolean({ description: "Send the text as a .txt file instead of chat messages — use for long reports/reading lists" })),
 	filename: Type.Optional(Type.String({ description: "File name when asDocument=true (default: report.txt)" })),
@@ -65,6 +66,7 @@ export default function telegramNotifyExtension(pi: ExtensionAPI) {
 			"Works from any network. Does NOT read or receive messages. " +
 			"A signed header (hostname · directory · session name · session id) is PREPENDED AUTOMATICALLY by the tool — " +
 			"do not add host/session/location information yourself. " +
+			"Write the text in GitHub-style markdown (bold **x**, code `x`, fences, [links](url), headers) — it is rendered properly in Telegram; do not avoid markdown formatting. " +
 			"Long texts: either use asDocument=true or send as multiple plain messages (splitting is automatic). " +
 			"Never ask the user to paste a bot token in chat — direct them to /telegram-notify-setup.",
 		parameters: NotifyParams,
@@ -118,9 +120,12 @@ export default function telegramNotifyExtension(pi: ExtensionAPI) {
 					return text_(`Delivered as document ${filename} (message id ${r.messageId}) via ${cfg.botUsername?.replace(/^@+/, "") ?? "bot"}.`);
 				}
 
-				const mode = params.parseMode ?? "none";
-				const sig = signature(mode, ctx, sessionName);
-				const r = await sendText(cfg.token, cfg.chatId, `${sig}\n\n${text}`, mode, params.silent === true);
+				const mode = params.parseMode ?? "markdown";
+				// the signature is markdown-free, so prepending before conversion is safe
+				const sig = signature(mode === "markdown" ? "HTML" : mode, ctx, sessionName);
+				const body = mode === "markdown" ? markdownToTelegramHtml(`${sig}\n\n${text}`) : `${sig}\n\n${text}`;
+				const wireMode = mode === "markdown" ? "HTML" : mode;
+				const r = await sendText(cfg.token, cfg.chatId, body, wireMode, params.silent === true);
 				if (!r.ok) return { ...text_(r.error), isError: true };
 				return text_(`Delivered ${r.chunks} message(s), ids ${r.messageIds.join(", ")}, via ${cfg.botUsername?.replace(/^@+/, "") ?? "bot"}.`);
 			} catch (err) {

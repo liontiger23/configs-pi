@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
 	buildConfig,
 	escapeFor,
+	markdownToTelegramHtml,
 	sendText,
 	shortenDir,
 	signature,
@@ -122,6 +123,29 @@ assert.equal(escapeFor("MarkdownV2", "1.2-3_4"), "1\\.2\\-3\\_4");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+}
+
+// ── markdownToTelegramHtml ───────────────────────────────────────
+{
+	assert.equal(markdownToTelegramHtml("**bold** and *it*"), "<b>bold</b> and <i>it</i>");
+	assert.equal(markdownToTelegramHtml("see `a.b(c)` now"), "see <code>a.b(c)</code> now");
+	assert.equal(markdownToTelegramHtml("[x](https://e.example)"), '<a href="https://e.example">x</a>');
+	assert.equal(markdownToTelegramHtml("## Head"), "<b>Head</b>");
+	assert.equal(markdownToTelegramHtml("- one\n- two"), "• one\n• two");
+	// fenced code: content escaped, markers gone, inner markdown untouched
+	assert.equal(markdownToTelegramHtml("```js\nif (a < b && c > d) {x()}\n```"), "<pre>if (a &lt; b &amp;&amp; c &gt; d) {x()}</pre>");
+	// unclosed fence tolerated
+	assert.match(markdownToTelegramHtml("text\n```\nfoo < bar"), /<pre>foo &lt; bar<\/pre>/);
+	// plain HTML in source is escaped, not injected
+	assert.equal(markdownToTelegramHtml("<script>x</script>"), "&lt;script&gt;x&lt;/script&gt;");
+	// code content is not re-escaped (no &amp;amp;)
+	assert.equal(markdownToTelegramHtml("`a & b`"), "<code>a &amp; b</code>");
+	// markdown-free text passes through unchanged
+	assert.equal(markdownToTelegramHtml("just words 1.2"), "just words 1.2");
+	// snake_case is not italicized (no _ handling)
+	assert.equal(markdownToTelegramHtml("var my_var = 1"), "var my_var = 1");
+	// signature line survives conversion untouched
+	assert.equal(markdownToTelegramHtml("📡 prime · ~/work/tmp-1 · (untitled) · a1b2c3d4"), "📡 prime · ~/work/tmp-1 · (untitled) · a1b2c3d4");
 }
 
 // ── sendText against a stubbed fetch (split + failure semantics) ────────

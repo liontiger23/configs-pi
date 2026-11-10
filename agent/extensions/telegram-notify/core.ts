@@ -71,9 +71,7 @@ export function signature(
 	const cwd = ctx.sessionManager?.getCwd?.() ?? process.cwd();
 	const sid = ctx.sessionManager?.getSessionId?.()?.slice(0, 8) ?? "????????";
 	const name = sessionName?.trim() || "(untitled)";
-	const raw = `📡 ${hostname()} · ${shortenDir(cwd)} · ${name} · ${sid}`;
-	if (mode === "HTML") return `<i>${escapeFor("HTML", raw)}</i>`;
-	return escapeFor(mode, raw);
+	return escapeFor(mode, `📡 ${hostname()} · ${shortenDir(cwd)} · ${name} · ${sid}`);
 }
 
 // ── Credential resolution ──────────────────────────────────────────────
@@ -173,6 +171,52 @@ export async function tgApi(
 		body: body ? JSON.stringify(body) : undefined,
 	});
 	return (await res.json()) as { ok: boolean; result?: unknown; description?: string; error_code?: number };
+}
+
+/**
+ * Convert GitHub-style markdown (what models naturally emit) to the subset of
+ * HTML Telegram accepts: bold, italic, inline code, fenced code blocks, links,
+ * headers → bold lines, dash bullets → •. Everything else passes through.
+ * Unbalanced fences are tolerated (closed at end of text).
+ */
+export function markdownToTelegramHtml(md: string): string {
+	// 1. extract fenced code blocks (before any escaping), placeholders keep positions
+	const blocks: string[] = [];
+	let s = md.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g, (_m, code: string) => {
+		blocks.push(code.replace(/\n$/, ""));
+		return `\u0000B${blocks.length - 1}\u0000`;
+	});
+	// unclosed fence: treat the rest as a code block
+	const open = s.indexOf("```");
+	if (open !== -1) {
+		blocks.push(s.slice(open + 3).replace(/^[a-zA-Z0-9_-]*\n?/, ""));
+		s = s.slice(0, open) + `\u0000B${blocks.length - 1}\u0000`;
+	}
+
+	// 2. escape HTML in the remaining text
+	s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+	// 3. inline code (content already HTML-escaped; restore as-is to avoid double escaping)
+	const codes: string[] = [];
+	s = s.replace(/`([^`\n]+)`/g, (_m, c: string) => {
+		codes.push(c);
+		return `\u0000C${codes.length - 1}\u0000`;
+	});
+
+	// 4. links, bold, italic, headers, bullets
+	s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>');
+	s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+	s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<i>$2</i>");
+	s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+	s = s.replace(/^(\s*)[-*]\s+/gm, "$1• ");
+
+	// 5. restore: code blocks were captured pre-escape → escape now; inline code already escaped
+	s = s.replace(/\u0000C(\d+)\u0000/g, (_m, i: string) => `<code>${codes[+i]}</code>`);
+	s = s.replace(/\u0000B(\d+)\u0000/g, (_m, i: string) => {
+		const esc = blocks[+i].replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+		return `<pre>${esc}</pre>`;
+	});
+	return s;
 }
 
 /** Split text into <=limit chunks, preferring paragraph, then line, boundaries. */
