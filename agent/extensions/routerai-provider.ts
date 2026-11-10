@@ -17,7 +17,7 @@
  *     endpoint pricing (force), and re-applies the current model.
  *   - `/routerai-models` opens a searchable price picker (like /model)
  *     with capability filters, pin-for-comparison (ctrl+space), a cost
- *     sort toggle (ctrl+s), a deep refresh of visible+pinned models
+ *     sort toggle (ctrl+t), a deep refresh of visible+pinned models
  *     (ctrl+r) and a provider preference chooser for the highlighted
  *     model (ctrl+p). Opening it TTL-debounces a cheap catalog-list
  *     refresh.
@@ -114,6 +114,7 @@ interface RouterAIEndpoint {
 	tag: string;
 	pricing: RouterAIPricing;
 	quantization?: string | null;
+	countries?: string[];
 }
 
 interface RouterAIModel {
@@ -320,6 +321,42 @@ function saveProviderPrefsToSettings(): void {
 }
 
 loadProviderPrefsFromSettings();
+
+/** Persisted default model (settings.json defaultProvider/defaultModel) —
+ * the same keys the built-in /model picker's ctrl+s writes. */
+interface DefaultModelSetting {
+	provider: string;
+	id: string;
+}
+
+/** Read the persisted default model from settings.json. */
+function readDefaultModelSetting(): DefaultModelSetting | null {
+	try {
+		if (!existsSync(SETTINGS_PATH)) return null;
+		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+		if (typeof parsed.defaultProvider === "string" && typeof parsed.defaultModel === "string") {
+			return { provider: parsed.defaultProvider, id: parsed.defaultModel };
+		}
+	} catch {
+		// malformed settings: no default
+	}
+	return null;
+}
+
+/** Persist the default model to settings.json (read-modify-write, preserving
+ * all other settings) — the same thing the built-in /model picker's ctrl+s does. */
+function writeDefaultModelSetting(provider: string, id: string): void {
+	try {
+		const settings = existsSync(SETTINGS_PATH)
+			? JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"))
+			: {};
+		settings.defaultProvider = provider;
+		settings.defaultModel = id;
+		writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+	} catch {
+		// best effort: the selection stays session-only
+	}
+}
 
 /**
  * TTL for cached per-model pricing and the catalog list, in minutes (settings
@@ -630,10 +667,11 @@ interface SortOption {
 }
 
 const PIN_KEY = "ctrl+space";
-const SORT_KEY = "ctrl+s";
+const SORT_KEY = "ctrl+t";
 const REFRESH_KEY = "ctrl+r";
 const PROV_KEY = "ctrl+p";
 const ORDER_KEY = "ctrl+o";
+const DEFAULT_KEY = "ctrl+s";
 const PIN_MARKER = "◆ ";
 
 // Aligned side-by-side comparison table for pinned models.
@@ -1010,6 +1048,7 @@ export default async function (pi: ExtensionAPI) {
 
 			const current = ctx.model;
 			let sortIndex = 0;
+			let defaultSel = readDefaultModelSetting();
 
 			// value: model id (search key), label: display name,
 			// description: prices + context window + capability badges.
@@ -1138,7 +1177,17 @@ export default async function (pi: ExtensionAPI) {
 					}
 
 					function refresh(keepSelection: boolean) {
-						const filtered = computeFiltered();
+						let filtered = computeFiltered();
+						// "· default" badge on the persisted default model (clones —
+						// byId labels stay pristine for search/pin management)
+						if (defaultSel) {
+							const def = defaultSel;
+							filtered = filtered.map((it) =>
+								it.model.provider === def.provider && it.model.id === def.id
+									? { ...it, label: `${it.label} · default` }
+									: it,
+							);
+						}
 						makeList(filtered, keepSelection);
 						setPinTable();
 						setSortStatus();
@@ -1170,6 +1219,18 @@ export default async function (pi: ExtensionAPI) {
 
 					function cycleSort() {
 						sortIndex = (sortIndex + 1) % SORTS.length;
+						refresh(true);
+					}
+
+					// ctrl+s: persist the highlighted model as the global default
+					// (settings.json defaultProvider/defaultModel — same as the
+					// built-in /model picker's "save as default").
+					function saveHighlightedAsDefault() {
+						const item = selectList.getSelectedItem() as PickerItem | null;
+						if (!item) return;
+						writeDefaultModelSetting(item.model.provider, item.model.id);
+						defaultSel = { provider: item.model.provider, id: item.model.id };
+						statusLine.setText(theme.fg("accent", `  ✓ default model saved: ${item.model.provider}/${item.model.id}`));
 						refresh(true);
 					}
 
@@ -1216,7 +1277,7 @@ export default async function (pi: ExtensionAPI) {
 					container.addChild(listContainer);
 					container.addChild(statusLine);
 					container.addChild(sortStatus);
-					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${PIN_KEY} pin/unpin · ${SORT_KEY} sort · ${REFRESH_KEY} refresh prices · ${PROV_KEY} providers · filters: ${filtersHint}`)));
+					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${PIN_KEY} pin/unpin · ${SORT_KEY} sort · ${REFRESH_KEY} refresh prices · ${PROV_KEY} providers · ${DEFAULT_KEY} default · filters: ${filtersHint}`)));
 
 					refresh(false);
 
@@ -1248,6 +1309,8 @@ export default async function (pi: ExtensionAPI) {
 								}
 							} else if (matchesKey(data, PIN_KEY)) {
 								pinHighlighted();
+							} else if (matchesKey(data, DEFAULT_KEY)) {
+								saveHighlightedAsDefault();
 							} else if (matchesKey(data, SORT_KEY)) {
 								cycleSort();
 							} else {
