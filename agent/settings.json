@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "1.3.0",
   "theme": "catppuccin-latte/catppuccin-mocha",
-  "defaultProvider": "routerai",
-  "defaultModel": "~z-ai/glm-flash-latest",
+  "defaultProvider": "gptplus5",
+  "defaultModel": "glm-5.3-flash",
   "compactionThreshold": 120000,
   "packages": [],
   "defaultThinkingLevel": "high",
