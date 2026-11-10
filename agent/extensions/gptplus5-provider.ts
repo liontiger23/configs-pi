@@ -52,8 +52,10 @@
  *     settings.json `gptplus5.reasoningReplay`: "duplicate" (default),
  *     "rename", or "off".
  *   - `/gptplus5-models` opens a provider-scoped, searchable model picker
- *     with prices (like `/routerai-models`): price sorts (ctrl+s), a catalog
- *     refresh (ctrl+r) and capability filter tokens (free/cheap/big/current).
+ *     with prices (like `/routerai-models`): price sorts (ctrl+t), a catalog
+ *     refresh (ctrl+r), capability filter tokens (free/cheap/big/current) and
+ *     ctrl+s to persist the highlighted model as the global default — the
+ *     same key and effect as the built-in /model picker's "save as default".
  *     Provider-scoped because pi's built-in /model search matches tokens as
  *     subsequences of "provider id" — typing "gptplus5 glm" there also hits
  *     e.g. MiniMax ("gptplus5" supplies g…l, "minimax" the m).
@@ -584,6 +586,42 @@ function updateFooter(ctx: ExtensionContext) {
 	);
 }
 
+/** Persisted default model (settings.json defaultProvider/defaultModel) —
+ * the same keys the built-in /model picker's ctrl+s writes. */
+interface DefaultModelSetting {
+	provider: string;
+	id: string;
+}
+
+/** Read the persisted default model from settings.json. */
+function readDefaultModelSetting(): DefaultModelSetting | null {
+	try {
+		if (!existsSync(SETTINGS_PATH)) return null;
+		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+		if (typeof parsed.defaultProvider === "string" && typeof parsed.defaultModel === "string") {
+			return { provider: parsed.defaultProvider, id: parsed.defaultModel };
+		}
+	} catch {
+		// malformed settings: no default
+	}
+	return null;
+}
+
+/** Persist the default model to settings.json (read-modify-write, preserving
+ * all other settings) — the same thing the built-in /model picker's ctrl+s does. */
+function writeDefaultModelSetting(provider: string, id: string): void {
+	try {
+		const settings = existsSync(SETTINGS_PATH)
+			? JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"))
+			: {};
+		settings.defaultProvider = provider;
+		settings.defaultModel = id;
+		writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+	} catch {
+		// best effort: the selection stays session-only
+	}
+}
+
 function fmtCtx(model: GptPlus5Model): string {
 	const real = model.rawContextWindow ?? model.contextWindow;
 	const ctx = real >= 1000 ? `${Math.round(real / 1000)}k` : `${real}`;
@@ -610,8 +648,9 @@ interface SortOption {
 	cmp?: (a: GptPlus5Model, b: GptPlus5Model) => number;
 }
 
-const SORT_KEY = "ctrl+s";
+const SORT_KEY = "ctrl+t";
 const REFRESH_KEY = "ctrl+r";
+const DEFAULT_KEY = "ctrl+s";
 
 export default async function (pi: ExtensionAPI) {
 	// ── GLM reasoning replay (see header comment) ──
@@ -703,6 +742,8 @@ export default async function (pi: ExtensionAPI) {
 	// Scoped to GPTPlus5 models only — pi's built-in /model search can't do
 	// "provider first, then model name" because its subsequence matching lets
 	// the provider name satisfy model-name tokens (see header comment).
+	// ctrl+s = save highlighted model as global default (matches the built-in
+	// /model picker's "save as default" semantics, app.models.save = ctrl+s).
 
 	pi.registerCommand("gptplus5-models", {
 		description: "Searchable GPTPlus5 model picker with prices",
@@ -718,6 +759,7 @@ export default async function (pi: ExtensionAPI) {
 
 			const current = ctx.model;
 			let sortIndex = 0;
+			let defaultSel = readDefaultModelSetting();
 
 			const SORTS: SortOption[] = [
 				// "best match": preserves fuzzyFilter's ranking; catalog order when
@@ -827,7 +869,17 @@ export default async function (pi: ExtensionAPI) {
 					}
 
 					function refresh(keepSelection: boolean) {
-						const filtered = computeFiltered();
+						let filtered = computeFiltered();
+						// "· default" badge on the persisted default model (clones —
+						// byId labels stay pristine for search/matching)
+						if (defaultSel) {
+							const def = defaultSel;
+							filtered = filtered.map((it) =>
+								it.model.provider === def.provider && it.model.id === def.id
+									? { ...it, label: `${it.label} · default` }
+									: it,
+							);
+						}
 						makeList(filtered, keepSelection);
 						setSortStatus();
 						countLine.setText(theme.fg("dim", `  ${filtered.length} / ${byId.size} models`));
@@ -835,6 +887,18 @@ export default async function (pi: ExtensionAPI) {
 
 					function cycleSort() {
 						sortIndex = (sortIndex + 1) % SORTS.length;
+						refresh(true);
+					}
+
+					// ctrl+s: persist the highlighted model as the global default
+					// (settings.json defaultProvider/defaultModel — same as the
+					// built-in /model picker's "save as default").
+					function saveHighlightedAsDefault() {
+						const item = selectList.getSelectedItem() as PickerItem | null;
+						if (!item) return;
+						writeDefaultModelSetting(item.model.provider, item.model.id);
+						defaultSel = { provider: item.model.provider, id: item.model.id };
+						statusLine.setText(theme.fg("accent", `  ✓ default model saved: ${item.model.provider}/${item.model.id}`));
 						refresh(true);
 					}
 
@@ -863,7 +927,7 @@ export default async function (pi: ExtensionAPI) {
 					container.addChild(listContainer);
 					container.addChild(statusLine);
 					container.addChild(sortStatus);
-					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${SORT_KEY} sort · ${REFRESH_KEY} refresh · filters: ${filtersHint}`)));
+					container.addChild(new Text(theme.fg("dim", `↑↓ navigate · enter select · esc cancel · ${SORT_KEY} sort · ${REFRESH_KEY} refresh · ${DEFAULT_KEY} default · filters: ${filtersHint}`)));
 
 					refresh(false);
 
@@ -887,6 +951,8 @@ export default async function (pi: ExtensionAPI) {
 								selectList.handleInput(data);
 							} else if (matchesKey(data, REFRESH_KEY)) {
 								void refreshCatalog();
+							} else if (matchesKey(data, DEFAULT_KEY)) {
+								saveHighlightedAsDefault();
 							} else if (matchesKey(data, SORT_KEY)) {
 								cycleSort();
 							} else {
