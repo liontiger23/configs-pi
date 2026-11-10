@@ -4,12 +4,19 @@
 
 This repository is the live pi agent directory: `~/.pi` is a symlink to this
 checkout. Files here take effect in new sessions, or via `/reload` for
-settings, keybindings, instructions, and resources.
+settings, keybindings, instructions, resources, and extensions (reload
+replaces the extension runtime).
 
 ## Layout
 
-- `agent/extensions/` — TypeScript pi extensions
+- `agent/extensions/` — TypeScript pi extensions. pi loads every direct
+  `.ts`/`.js` file here as an extension (each needs a default factory export),
+  and subdirectories containing an `index.ts`/`index.js` as one extension.
+  Multi-file extensions use the subdirectory form: helper modules live next
+  to `index.ts` and must NOT be placed as direct files in `extensions/`.
 - `agent/skills/<name>/SKILL.md` — skills
+- `agent/tests/` — extension tests (plain assert-based, no dev deps), run via
+  the jiti loader bundled with pi against the real extension files
 - `agent/settings.json` — pi settings
 - Runtime data lives here too but is gitignored: `agent/sessions/`,
   `agent/npm/`, `agent/auth.json`, `agent/models-store.json`,
@@ -22,6 +29,9 @@ settings, keybindings, instructions, and resources.
 - After adding or changing an extension or skill, update the Contents
   section of `README.md` — keep the one-line descriptions accurate and the
   relative links working.
+- After changing an extension, keep its test in `agent/tests/` passing
+  (create one when the extension has none) and re-verify the extension
+  still loads in a fresh `pi` session before committing.
 - Commit changes to git. Ask before pushing.
 - `agent/settings.json` is live configuration, not code: extensions (e.g.
   routerai-provider's provider preferences, compaction threshold) and pi
