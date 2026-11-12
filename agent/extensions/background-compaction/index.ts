@@ -172,7 +172,12 @@ export default function (pi: ExtensionAPI) {
 		}, DONE_STATUS_MS);
 	};
 
-	// Footer gauge: when will background compaction fire.
+	// Footer gauge: when will background compaction fire. Color bands mirror
+	// pi's built-in footer context display (>90 error, >70 warning), but the
+	// percentage is measured against the compaction threshold — 100% here is
+	// when background compaction fires. While a job is in flight the live
+	// estimate keeps creeping (the session keeps appending until the summary
+	// lands), so mark the gauge to make that self-explanatory.
 	const updateGauge = (ctx: ExtensionContext) => {
 		latestCtx = ctx;
 		if (!ctx.hasUI) return;
@@ -181,11 +186,26 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		const tokens = ctx.getContextUsage()?.tokens ?? 0;
+		const tokens = ctx.getContextUsage()?.tokens;
+		const suffix = job && !job.applied ? " · ⟳ compacting" : "";
+		if (tokens == null) {
+			// Unknown right after a compaction until the next LLM response —
+			// same '?' convention as pi's built-in footer.
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				ctx.ui.theme.fg("dim", `⏲ ?/${formatTokens(threshold)}${suffix}`),
+			);
+			return;
+		}
 		const pct = Math.min(999, Math.round((tokens / threshold) * 100));
+		const body = `⏲ ${formatTokens(tokens)}/${formatTokens(threshold)} (${pct}%)${suffix}`;
 		ctx.ui.setStatus(
 			STATUS_KEY,
-			ctx.ui.theme.fg("dim", `⏲ ${formatTokens(tokens)}/${formatTokens(threshold)} (${pct}%)`),
+			pct > 90
+				? ctx.ui.theme.fg("error", body)
+				: pct > 70
+					? ctx.ui.theme.fg("warning", body)
+					: ctx.ui.theme.fg("dim", body),
 		);
 	};
 
