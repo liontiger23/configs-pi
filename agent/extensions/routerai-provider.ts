@@ -53,17 +53,6 @@
  *      on failure the cheapest of the rest") and the label observed on the
  *      model pages. No hardcoded overrides.
  *
- * Context clamping for auto-compaction:
- *   The reported `contextWindow` of every RouterAI model is clamped to
- *   `compactionThreshold + reserveTokens` (read from settings.json, falling
- *   back to COMPACTION_THRESHOLD). pi's native auto-compaction triggers at
- *   `contextTokens > contextWindow - reserveTokens`, so this makes pi compact
- *   at an absolute token threshold — including the mid-run (split-turn)
- *   check, which compacts between tool batches and continues the run.
- *   `maxTokens` is still derived from the model's real context length.
- *   The raw context length is kept on the model as `rawContextWindow` so UI
- *   can display the true value.
- *
  * GLM reasoning replay (`before_provider_request`):
  *   RouterAI streams reasoning traces in the `reasoning` field, so pi saves
  *   thinking blocks with signature `reasoning` and replays them under that
@@ -136,49 +125,7 @@ interface RouterAIModel {
 const PROVIDER_ID = "routerai";
 const BASE_URL = "https://routerai.ru/api/v1";
 
-// ── Compaction threshold clamp ──
-// Native compaction fires when contextTokens > contextWindow - reserveTokens,
-// so clamping contextWindow to (threshold + reserveTokens) makes pi compact
-// once the context crosses `threshold` — with native mid-run continuation.
-
-/** Absolute token threshold at which compaction should trigger. */
-const COMPACTION_THRESHOLD = 150_000;
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-
-/**
- * Effective compaction threshold: reads `compactionThreshold` from
- * settings.json (shared with the compaction-threshold extension), falling
- * back to COMPACTION_THRESHOLD. `null` disables the clamp (use the real
- * context length).
- */
-function getCompactionThreshold(): number | null {
-	try {
-		if (!existsSync(SETTINGS_PATH)) return COMPACTION_THRESHOLD;
-		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
-		const value = parsed["compactionThreshold"];
-		if (value === null) return null;
-		return typeof value === "number" && value >= 1000 ? value : COMPACTION_THRESHOLD;
-	} catch {
-		return COMPACTION_THRESHOLD;
-	}
-}
-
-/**
- * Keep reserveTokens in sync with settings.json `compaction.reserveTokens`
- * so the effective trigger stays at exactly `threshold`.
- */
-function getReserveTokens(): number {
-	try {
-		if (existsSync(SETTINGS_PATH)) {
-			const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
-			const value = parsed["compaction"]?.["reserveTokens"];
-			if (typeof value === "number" && value > 0) return value;
-		}
-	} catch {
-		// fall through to default
-	}
-	return 16_384;
-}
 
 // ── Per-provider endpoint pricing (lazy, per model) ──
 // model id → { checkedAt, endpoints: ProviderEndpoint[] }, ordered as
@@ -420,56 +367,6 @@ function normalizeReasoningReplay(payload: unknown): unknown {
 	return payload;
 }
 
-function clampContextWindow(realContextWindow: number): number {
-	const threshold = getCompactionThreshold();
-	// null ("off") or a threshold at/above the real window: no clamp needed —
-	// pi's native window-relative compaction fires first anyway.
-	if (threshold === null || threshold >= realContextWindow) {
-		return realContextWindow;
-	}
-	const reserve = getReserveTokens();
-	return Math.min(realContextWindow, threshold + reserve);
-}
-
-// ── Compaction threshold: dynamic setting + UI ──
-// The clamp above reads `compactionThreshold` from settings.json on every
-// catalog fetch, so changing the setting + refreshing the catalog moves the
-// compaction trigger. This section ports the UI from the old
-// compaction-threshold extension: /compact-threshold menu + footer %.
-
-/** Save threshold to global settings.json. null = clamp off. */
-function saveGlobalThreshold(n: number | null): boolean {
-	try {
-		const raw = readFileSync(SETTINGS_PATH, "utf-8");
-		const parsed = JSON.parse(raw);
-		parsed["compactionThreshold"] = n;
-		writeFileSync(SETTINGS_PATH, JSON.stringify(parsed, null, 2) + "\n", "utf-8");
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function parseThresholdInput(input: string): number | null {
-	const s = input.trim().toLowerCase();
-	if (!s) return null;
-	const match = s.match(/^(\d+(?:\.\d+)?)([km]?)$/);
-	if (!match) return null;
-	let val = parseFloat(match[1]);
-	const suffix = match[2];
-	if (suffix === "k") val *= 1000;
-	else if (suffix === "m") val *= 1_000_000;
-	return Math.round(val);
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-	return `${Math.round(count / 1000000)}M`;
-}
-
 function isTextModel(modality: string): boolean {
 	const outputPart = modality.split("->")[1] ?? "";
 	return outputPart.includes("text");
@@ -498,10 +395,7 @@ function toModelDef(m: RouterAIModel, basePricing?: RouterAIPricing): Model<"ope
 	}
 
 	const realContextWindow = m.context_length ?? 128000;
-	// Clamp the window pi sees so native auto-compaction (threshold,
-	// overflow, and mid-run split-turn checks) fires at our absolute
-	// threshold and continues the run. See header comment.
-	const contextWindow = clampContextWindow(realContextWindow);
+	const contextWindow = realContextWindow;
 
 	// RouterAI returns prices in RUB/token. Keep as RUB per million tokens.
 	// Base estimate = the PRIORITY provider's pricing (first endpoint in the
@@ -545,8 +439,7 @@ function toModelDef(m: RouterAIModel, basePricing?: RouterAIPricing): Model<"ope
 		// Raw context length for display (footer/picker); pi ignores unknown fields.
 		rawContextWindow: realContextWindow,
 		// Use a high default maxTokens — 4096 was too low for reasoning models (issue #7855)
-		// Derive from the REAL context length, not the clamped window — the clamp
-		// only exists to move the compaction trigger earlier.
+		// Derived from the real context length.
 		maxTokens: Math.max(realContextWindow > 0 ? Math.min(realContextWindow, 64000) : 32000, 32000),
 		...(Object.keys(compat).length > 0 ? { compat } : {}),
 	};
@@ -622,7 +515,7 @@ function fmtPrice(rubPerMtok: number): string {
 	return s.endsWith("0") ? s.slice(0, -1) : s;
 }
 
-/** Compact token-count format: 1048576 → 1M, 943717 → 944k. */
+/** Short token-count format: 1048576 → 1M, 943717 → 944k. */
 function fmtTokens(n?: number): string {
 	if (!n || !Number.isFinite(n)) return "?";
 	if (n >= 1_000_000) {
@@ -633,12 +526,7 @@ function fmtTokens(n?: number): string {
 }
 
 function fmtCtx(model: Model<"openai-completions"> & { rawContextWindow?: number }): string {
-	const real = model.rawContextWindow ?? model.contextWindow;
-	const ctx = fmtCtxTokens(real);
-	if (model.contextWindow < real) {
-		return `${ctx} (♻${fmtCtxTokens(model.contextWindow)})`;
-	}
-	return ctx;
+	return fmtCtxTokens(model.rawContextWindow ?? model.contextWindow);
 }
 
 function fmtCtxTokens(tokens: number): string {
@@ -1649,111 +1537,6 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	// ── Keep prices and footer fresh ──
-
-	// Current compaction threshold (read from settings.json; dynamic — the menu
-	// writes the file, and the clamp re-reads it on every catalog fetch).
-
-	// ── /compact-threshold: interactive menu (ported from compaction-threshold) ──
-
-	pi.registerCommand("compact-threshold", {
-		description: "Show/set proactive compaction threshold (tokens). Supports k/M suffixes.",
-		handler: async (_args, ctx) => {
-			const threshold = getCompactionThreshold();
-			const currentVal = threshold === null ? "off" : formatTokens(threshold);
-			let persistOnSubmit = false;
-
-			await ctx.ui.custom<void>(
-				(tui, theme, _kb, done) => {
-					const container = new Container();
-
-					container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-					container.addChild(new Text(theme.fg("accent", theme.bold("Compaction Threshold")), 1, 0));
-					container.addChild(new Text("", 0, 0));
-					container.addChild(new Text(theme.fg("dim", `Current: ${theme.fg("text", currentVal)}`), 1, 0));
-					container.addChild(new Text("", 0, 0));
-
-					const input = new Input({ prompt: theme.fg("accent", "New threshold: ") });
-					input.onSubmit = (value) => {
-						const trimmed = value.trim();
-						if (!trimmed) {
-							done(undefined);
-							return;
-						}
-						if (trimmed.toLowerCase() === "off" || trimmed.toLowerCase() === "disable") {
-							if (!saveGlobalThreshold(null)) {
-								ctx.ui.notify("Failed to write settings.json", "error");
-								done(undefined);
-								return;
-							}
-							if (persistOnSubmit) persistOnSubmit = false;
-							ctx.ui.notify("Proactive compaction disabled", "warning");
-							done(undefined);
-							return;
-						}
-						const parsed = parseThresholdInput(trimmed);
-						if (parsed !== null && parsed >= 1000) {
-							if (!saveGlobalThreshold(parsed)) {
-								ctx.ui.notify("Failed to write settings.json", "error");
-								done(undefined);
-								return;
-							}
-							if (persistOnSubmit) persistOnSubmit = false;
-							ctx.ui.notify(
-								`Threshold set to ${formatTokens(parsed)} — refresh the catalog (restart or /routerai-models re-pick) to apply`,
-								"info",
-							);
-							done(undefined);
-						} else {
-							ctx.ui.notify("Invalid threshold. Use a number ≥ 1000, or 'off'.", "error");
-						}
-					};
-					input.onEscape = () => done(undefined);
-					container.addChild(input);
-
-					const previewText = new Text("", 1, 0);
-					container.addChild(previewText);
-					const persistIndicator = new Text("", 1, 0);
-					container.addChild(persistIndicator);
-					container.addChild(new Text(theme.fg("dim", "Enter: confirm · Esc: cancel · settings saved to ~/.pi/agent/settings.json"), 1, 0));
-					container.addChild(new Text(theme.fg("dim", "Supports k/M suffixes · 'off' to disable"), 1, 0));
-					container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-
-					return {
-						render: (w) => container.render(w),
-						invalidate: () => container.invalidate(),
-						handleInput: (data) => {
-							if (matchesKey(data, Key.ctrl("s"))) {
-								// Kept for muscle memory from the old extension; saving is
-								// now always global, so this is a no-op toggle.
-								persistOnSubmit = !persistOnSubmit;
-								persistIndicator.setText(theme.fg("dim", persistOnSubmit ? "  (always saved globally)" : ""));
-								tui.requestRender();
-								return;
-							}
-							input.handleInput(data);
-							const val = input.getValue();
-							if (val.trim()) {
-								const lower = val.trim().toLowerCase();
-								if (lower === "off" || lower === "disable") {
-									previewText.setText(theme.fg("dim", "  → compaction clamp disabled"));
-								} else {
-									const parsed = parseThresholdInput(val);
-									if (parsed !== null) {
-										previewText.setText(theme.fg("dim", `  → ${formatTokens(parsed)}`));
-									} else {
-										previewText.setText(theme.fg("warning", "  (invalid)"));
-									}
-								}
-							} else {
-								previewText.setText("");
-							}
-							tui.requestRender();
-						},
-					};
-				},
-			);
-		},
-	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		// The persisted catalog is already restored at this point (offline phase).

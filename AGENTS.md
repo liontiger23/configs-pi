@@ -29,9 +29,11 @@ replaces the extension runtime).
 - After adding or changing an extension or skill, update the Contents
   section of `README.md` — keep the one-line descriptions accurate and the
   relative links working.
-- After changing an extension, keep its test in `agent/tests/` passing
-  (create one when the extension has none) and re-verify the extension
-  still loads in a fresh `pi` session before committing.
+- After changing an extension, keep its test in `agent/tests/` passing and
+  re-verify the extension still loads in a fresh `pi` session before
+  committing. Tests are only needed where they make sense — pure logic worth
+  regression-testing (parsers, detection rules, settings semantics); simple
+  UI/glue extensions don't need one.
 - Commit changes to git. Ask before pushing.
 - `agent/settings.json` is live configuration, not code: extensions (e.g.
   routerai-provider's provider preferences, compaction threshold) and pi
