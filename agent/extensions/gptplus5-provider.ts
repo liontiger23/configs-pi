@@ -29,10 +29,6 @@
  *   - The API exposes NO context lengths and NO modality/parameter
  *     metadata, so context windows come from a hardcoded per-family table
  *     (fallback 128k) and all models are declared text-only, non-reasoning.
- *   - Context windows are clamped to `compactionThreshold +
- *     compaction.reserveTokens` from settings.json (shared with
- *     routerai-provider and its /compact-threshold command), so pi's
- *     native auto-compaction fires at an absolute token threshold.
  *   - Remaining key budget: new-api exposes OpenAI-compatible billing
  *     endpoints for the token itself:
  *       GET /v1/dashboard/billing/subscription → hard_limit_usd =
@@ -149,46 +145,6 @@ function getBalanceRefreshSeconds(): number {
 		// fall through to default
 	}
 	return 30;
-}
-
-/** Absolute token threshold at which compaction should trigger
- * (settings.json `compactionThreshold`, shared with routerai-provider). */
-function getCompactionThreshold(): number | null {
-	try {
-		if (!existsSync(SETTINGS_PATH)) return null;
-		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
-		const value = parsed["compactionThreshold"];
-		if (value === null) return null;
-		return typeof value === "number" && value >= 1000 ? value : null;
-	} catch {
-		return null;
-	}
-}
-
-function getReserveTokens(): number {
-	try {
-		if (existsSync(SETTINGS_PATH)) {
-			const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
-			const value = parsed["compaction"]?.["reserveTokens"];
-			if (typeof value === "number" && value > 0) return value;
-		}
-	} catch {
-		// fall through to default
-	}
-	return 16_384;
-}
-
-/**
- * Clamp the context window pi sees so native auto-compaction (threshold,
- * overflow, and mid-run split-turn checks) fires at the absolute
- * `compactionThreshold` and continues the run. Mirrors routerai-provider.
- */
-function clampContextWindow(realContextWindow: number): number {
-	const threshold = getCompactionThreshold();
-	if (threshold === null || threshold >= realContextWindow) {
-		return realContextWindow;
-	}
-	return Math.min(realContextWindow, threshold + getReserveTokens());
 }
 
 // ── GLM reasoning replay normalization ──
@@ -343,7 +299,7 @@ type GptPlus5Model = Model<"openai-completions"> & {
 
 function toModelDef(m: PricingEntry, groupRatio: number): GptPlus5Model {
 	const realContextWindow = lookupContextWindow(m.model_name);
-	const contextWindow = clampContextWindow(realContextWindow);
+	const contextWindow = realContextWindow;
 
 	let inputPerMtok: number;
 	let outputPerMtok: number;
@@ -390,8 +346,7 @@ function toModelDef(m: PricingEntry, groupRatio: number): GptPlus5Model {
 		contextWindow,
 		rawContextWindow: realContextWindow,
 		tieredBilling,
-		// Derive from the REAL context length, not the clamped window — the
-		// clamp only exists to move the compaction trigger earlier.
+		// Derived from the real context length.
 		maxTokens: Math.max(Math.min(realContextWindow, 64_000), 32_000),
 	};
 }
@@ -638,12 +593,7 @@ function writeDefaultModelSetting(provider: string, id: string): void {
 
 function fmtCtx(model: GptPlus5Model): string {
 	const real = model.rawContextWindow ?? model.contextWindow;
-	const ctx = real >= 1000 ? `${Math.round(real / 1000)}k` : `${real}`;
-	if (model.contextWindow < real) {
-		const clamped = model.contextWindow >= 1000 ? `${Math.round(model.contextWindow / 1000)}k` : `${model.contextWindow}`;
-		return `${ctx} (♻${clamped})`;
-	}
-	return ctx;
+	return real >= 1000 ? `${Math.round(real / 1000)}k` : `${real}`;
 }
 
 interface PickerItem extends SelectItem {
