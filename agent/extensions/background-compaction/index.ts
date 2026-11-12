@@ -69,6 +69,18 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const SPINNER_INTERVAL_MS = 120;
 const DONE_STATUS_MS = 8_000;
 
+/** Compact duration, same format as the turn-timer extension. */
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, ms) / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	const hours = Math.floor(minutes / 60);
+	if (hours > 0) return `${hours}h ${minutes % 60}m ${remainder}s`;
+	return `${minutes}m ${remainder}s`;
+}
+
 /** Footer gauge (when will compaction fire). */
 const STATUS_KEY = "bg-compact";
 /** Editor widget (live job progress / result). */
@@ -152,10 +164,10 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 		let frame = 0;
 		const render = () => {
-			const elapsed = Math.round((Date.now() - j.startedAt) / 1000);
+			const elapsed = formatDuration(Date.now() - j.startedAt);
 			const spin = SPINNER_FRAMES[frame++ % SPINNER_FRAMES.length];
 			setWidgetText(ctx, [
-				`${spin} compaction in background · ~${formatTokens(j.tokensBefore)} tokens · ${j.messageCount} msgs · ${elapsed}s`,
+				`${spin} compaction in background · ~${formatTokens(j.tokensBefore)} tokens · ${j.messageCount} msgs · ${elapsed}`,
 			]);
 		};
 		render();
@@ -450,8 +462,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const doneWidget = (ctx: ExtensionContext, j: BgJob) => {
-		const duration = Math.round((Date.now() - j.startedAt) / 1000);
-		showDoneWidget(ctx, `✓ compacted ~${formatTokens(j.tokensBefore)} tokens in background · ${duration}s`);
+		const duration = formatDuration(Date.now() - j.startedAt);
+		showDoneWidget(ctx, `✓ compacted ~${formatTokens(j.tokensBefore)} tokens in background · ${duration}`);
 	};
 
 	const draftFrom = (result: CompactionResult): SessionBoundaryDraft => ({
